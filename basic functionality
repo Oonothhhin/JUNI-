@@ -1,0 +1,1639 @@
+/* =========================================================================
+   JUNI  —  physical focus timer UI
+   -------------------------------------------------------------------------
+   Hardware : ESP32-S3 (N16R8, PSRAM)  +  240x320 SPI TFT (ST7789)  +  rotary
+   Framework: Arduino
+
+   Wiring (DO NOT CHANGE)
+     TFT CS  -> 10      ENC S1  -> 6
+     TFT RST -> 9       ENC S2  -> 7
+     TFT DC  -> 4       ENC KEY -> 8
+     TFT SDA -> 11
+     TFT SCK -> 12
+
+   -------------------------------------------------------------------------
+   SECTION MAP
+     1  Configuration & pins
+     2  Types            <-- ALL structs/enums/classes live here, see note
+     3  Colour + math helpers
+     4  Framebuffer flush
+     5  Antialiased drawing primitives
+     6  Screen layout constants
+     7  Panda expression data
+     8  Panda renderer    (the ONLY place that knows about pixels)
+     9  Text engine       (supersampled, scalable, antialiased numerals)
+    10  UI layers         (panda / timer / status dot)
+    11  Application state machine
+    12  Input             (encoder + button)
+    13  Countdown
+    14  Animation update
+    15  Render orchestration (layer dirty model)
+    16  setup() / loop()
+
+   -------------------------------------------------------------------------
+   WHY EVERY TYPE IS DECLARED IN SECTION 2
+
+   The Arduino IDE auto-generates function prototypes and injects them
+   immediately before the FIRST function definition in the .ino file. Any
+   struct or enum declared after that point is invisible to those generated
+   prototypes, which fails with "'Rect' does not name a type".
+
+   So: section 2 contains every type and NO function definitions. Do not add
+   a function definition above it.
+   ========================================================================= */
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <SPI.h>
+#include <math.h>
+#include <string.h>
+
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+
+
+/* =========================================================================
+   1.  CONFIGURATION
+   ========================================================================= */
+
+#define TFT_CS    10
+#define TFT_RST    9
+#define TFT_DC     4
+#define TFT_MOSI  11
+#define TFT_SCLK  12
+
+#define ENC_S1     6
+#define ENC_S2     7
+#define ENC_KEY    8
+
+// If the display shows tearing or confetti noise, drop this to 24000000
+// (the Adafruit default). 40 MHz roughly halves every flush time.
+#define TFT_SPI_HZ 40000000
+
+// Set to 1 if turning the knob clockwise decreases the time on your unit.
+#define ENC_INVERT 0
+
+// Very subtle 1.5 px vertical "breathing" pulse. Set to 0 to disable.
+#define JUNI_BREATHING 1
+
+// Serial state trace, useful while testing each state.
+#define JUNI_DEBUG 1
+
+#define SCREEN_W 240
+#define SCREEN_H 320
+
+// Animation frame budget: ~33 fps ceiling. Nothing redraws when idle.
+#define FRAME_MS 30
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+
+/* =========================================================================
+   2.  TYPES
+   -------------------------------------------------------------------------
+   Declarations only. No function definitions in this section -- see the
+   note in the file header for why that matters.
+   ========================================================================= */
+
+// ---- colour -------------------------------------------------------------
+
+struct Col { uint8_t r, g, b; };
+
+// ---- rectangles ---------------------------------------------------------
+
+struct Rect { int16_t x, y, w, h; };
+
+// ---- easing -------------------------------------------------------------
+
+enum Ease : uint8_t { EASE_LINEAR, EASE_SMOOTHSTEP, EASE_OUT_CUBIC, EASE_IN_OUT_CUBIC };
+
+// ---- panda expressions --------------------------------------------------
+
+enum PandaExpression : uint8_t {
+  PANDA_IDLE,
+  PANDA_BLINK,      // not a sequence: triggers one blink on the current face
+  PANDA_START,
+  PANDA_FOCUS,
+  PANDA_BREAK,
+  PANDA_WAKE,
+  PANDA_CANCEL,
+  PANDA_FINISH,
+  PANDA_WINK,
+  PANDA_EXPR_COUNT
+};
+
+enum EyeStyle   : uint8_t { EYE_OVAL, EYE_SLEEPY, EYE_HAPPY, EYE_WINK_R };
+enum MouthStyle : uint8_t { MOUTH_W, MOUTH_SMILE, MOUTH_BIG_SMILE, MOUTH_FLAT, MOUTH_DOWN };
+
+// A single moment of the face. Every expression is a list of these.
+struct FaceKey {
+  uint16_t t;         // ms from sequence start
+  float    eyeOpen;   // 0 = shut, 1 = normal, >1 = widened
+  uint8_t  eyeStyle;
+  uint8_t  mouth;
+  float    bob;       // px, negative = face lifts
+  float    wide;      // eye width multiplier
+  float    gazeY;     // -1..1, shifts eyes/highlights down when positive
+  float    sparkle;   // 0..1
+};
+
+struct FaceSeq {
+  const FaceKey *k;
+  uint8_t  n;
+  uint8_t  next;      // auto-advance to this expression when finished
+  bool     blink;     // allow idle blinking while holding the last key
+  bool     breathe;   // allow the breathing pulse while holding
+};
+
+// Live face state, rebuilt every animation frame.
+struct FaceState {
+  float   eyeOpen, wide, gazeX, gazeY, sparkle, bob;
+  uint8_t eyeStyle, mouth;
+};
+
+// A face plus where and how big to draw it.
+struct FaceRender {
+  float cx, cy, scale, alpha;
+  FaceState f;
+};
+
+// ---- render layers ------------------------------------------------------
+
+enum Layer : uint8_t { L_PANDA, L_TIMER, L_DOT, L_COUNT };
+
+struct TimerRender {
+  char    str[16];
+  float   cy, scale, alpha;
+  int16_t w, h;
+};
+
+// ---- application state --------------------------------------------------
+
+enum AppState : uint8_t {
+  IDLE,
+  TIME_SELECT,
+  STARTING,
+  FOCUS,
+  BREAK,
+  CANCELING,
+  FINISHED
+};
+
+// Interpolatable screen layout: every transition is a tween between two of
+// these, so panda and timer positions/scales/fades move together.
+struct Layout {
+  float pandaCy, pandaScale, pandaAlpha;
+  float timerCy, timerScale, timerAlpha;
+};
+
+/* ---- framebuffer -------------------------------------------------------
+   A full 240x320 RGB565 buffer (150 KB) living in PSRAM. Every draw call in
+   the whole sketch lands here, never on the panel. Each operation expands a
+   dirty rectangle; flush() then pushes ONLY that rectangle over SPI.
+
+   That is the entire anti-flicker strategy: the panel never sees a cleared
+   screen or a partially drawn frame, and untouched regions cost nothing.
+
+   The inline members below deliberately call no free functions, so this
+   class can sit up here in the types section.
+   ----------------------------------------------------------------------- */
+
+class JuniFB : public Adafruit_GFX {
+public:
+  uint16_t *buf = nullptr;
+  int16_t dx0, dy0, dx1, dy1;   // dirty rect; dx1 < dx0 means "empty"
+
+  JuniFB() : Adafruit_GFX(SCREEN_W, SCREEN_H) { clearDirty(); }
+
+  bool begin() {
+    size_t bytes = (size_t)SCREEN_W * SCREEN_H * 2;
+    buf = (uint16_t *)ps_malloc(bytes);          // PSRAM first
+    if (!buf) buf = (uint16_t *)malloc(bytes);   // internal RAM fallback
+    if (!buf) return false;
+    memset(buf, 0, bytes);
+    return true;
+  }
+
+  inline void clearDirty() { dx0 = SCREEN_W; dy0 = SCREEN_H; dx1 = -1; dy1 = -1; }
+  inline bool hasDirty() const { return dx1 >= dx0 && dy1 >= dy0; }
+
+  void mark(int16_t x, int16_t y, int16_t w, int16_t h) {
+    if (w <= 0 || h <= 0) return;
+    int16_t xa = x, ya = y, xb = x + w - 1, yb = y + h - 1;
+    if (xa < 0) xa = 0;
+    if (ya < 0) ya = 0;
+    if (xb > SCREEN_W - 1) xb = SCREEN_W - 1;
+    if (yb > SCREEN_H - 1) yb = SCREEN_H - 1;
+    if (xb < xa || yb < ya) return;
+    if (xa < dx0) dx0 = xa;
+    if (ya < dy0) dy0 = ya;
+    if (xb > dx1) dx1 = xb;
+    if (yb > dy1) dy1 = yb;
+  }
+
+  // ---- raw writers: bounds-checked, but they do NOT mark dirty. Layer
+  //      draw code always erases its own span first (which marks), and the
+  //      span is guaranteed to enclose everything the layer draws.
+  inline void px(int16_t x, int16_t y, uint16_t c) {
+    if ((uint16_t)x >= SCREEN_W || (uint16_t)y >= SCREEN_H) return;
+    buf[(int32_t)y * SCREEN_W + x] = c;
+  }
+
+  inline void hline(int16_t x, int16_t y, int16_t w, uint16_t c) {
+    if ((uint16_t)y >= SCREEN_H || w <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > SCREEN_W) w = SCREEN_W - x;
+    if (w <= 0) return;
+    uint16_t *p = &buf[(int32_t)y * SCREEN_W + x];
+    while (w--) *p++ = c;
+  }
+
+  // Coverage blend of colour c over whatever is already in the buffer.
+  // Done directly in 565 space -- plenty accurate for edge antialiasing.
+  inline void blend(int16_t x, int16_t y, const Col &c, uint8_t a) {
+    if ((uint16_t)x >= SCREEN_W || (uint16_t)y >= SCREEN_H) return;
+    if (a == 0) return;
+    int32_t i = (int32_t)y * SCREEN_W + x;
+    if (a >= 250) {
+      buf[i] = (uint16_t)(((uint16_t)(c.r & 0xF8) << 8) |
+                          ((uint16_t)(c.g & 0xFC) << 3) | (c.b >> 3));
+      return;
+    }
+    uint16_t d = buf[i];
+    uint16_t dr = (d >> 11) & 0x1F, dg = (d >> 5) & 0x3F, db = d & 0x1F;
+    uint16_t sr = c.r >> 3,         sg = c.g >> 2,        sb = c.b >> 3;
+    uint16_t ia = 255 - a;
+    uint16_t nr = (uint16_t)((sr * a + dr * ia + 127) / 255);
+    uint16_t ng = (uint16_t)((sg * a + dg * ia + 127) / 255);
+    uint16_t nb = (uint16_t)((sb * a + db * ia + 127) / 255);
+    buf[i] = (nr << 11) | (ng << 5) | nb;
+  }
+
+  // ---- Adafruit_GFX overrides (these DO mark dirty) --------------------
+  void drawPixel(int16_t x, int16_t y, uint16_t c) override {
+    if ((uint16_t)x >= SCREEN_W || (uint16_t)y >= SCREEN_H) return;
+    buf[(int32_t)y * SCREEN_W + x] = c;
+    mark(x, y, 1, 1);
+  }
+
+  void drawFastHLine(int16_t x, int16_t y, int16_t w, uint16_t c) override {
+    hline(x, y, w, c);
+    mark(x, y, w, 1);
+  }
+
+  void drawFastVLine(int16_t x, int16_t y, int16_t h, uint16_t c) override {
+    for (int16_t i = 0; i < h; i++) px(x, y + i, c);
+    mark(x, y, 1, h);
+  }
+
+  void fillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t c) override {
+    for (int16_t r = 0; r < h; r++) hline(x, y + r, w, c);
+    mark(x, y, w, h);
+  }
+
+  void fillScreen(uint16_t c) override {
+    if (c == 0) memset(buf, 0, (size_t)SCREEN_W * SCREEN_H * 2);
+    else for (int32_t i = 0; i < (int32_t)SCREEN_W * SCREEN_H; i++) buf[i] = c;
+    mark(0, 0, SCREEN_W, SCREEN_H);
+  }
+
+  void fillRectR(const Rect &r, uint16_t c) {
+    if (r.w > 0 && r.h > 0) fillRect(r.x, r.y, r.w, r.h, c);
+  }
+
+  void flush();   // defined in section 4 (needs `tft`)
+};
+
+JuniFB fb;
+
+
+/* =========================================================================
+   3.  COLOUR + MATH HELPERS
+   ========================================================================= */
+
+static inline uint16_t to565(const Col &c) {
+  return ((uint16_t)(c.r & 0xF8) << 8) | ((uint16_t)(c.g & 0xFC) << 3) | (c.b >> 3);
+}
+
+// A slightly warm white reads far more "premium" than pure #FFFFFF on an
+// ST7789, which tends to run cool.
+static inline Col warmWhite(float a) {
+  if (a < 0.0f) a = 0.0f;
+  if (a > 1.0f) a = 1.0f;
+  return Col{ (uint8_t)(255.0f * a), (uint8_t)(252.0f * a), (uint8_t)(244.0f * a) };
+}
+static const Col INK = { 0, 0, 0 };
+
+static inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+// Progress of an animation, always clamped to 0..1 and safe against
+// millis() wrap because the subtraction is unsigned.
+float getAnimationProgress(unsigned long now, unsigned long start, unsigned long duration) {
+  if (duration == 0) return 1.0f;
+  unsigned long e = now - start;
+  if (e >= duration) return 1.0f;
+  return (float)e / (float)duration;
+}
+
+static float applyEase(uint8_t e, float p) {
+  switch (e) {
+    case EASE_SMOOTHSTEP:   return p * p * (3.0f - 2.0f * p);
+    case EASE_OUT_CUBIC:  { float u = 1.0f - p; return 1.0f - u * u * u; }
+    case EASE_IN_OUT_CUBIC: return (p < 0.5f) ? (4.0f * p * p * p)
+                                              : (1.0f - powf(-2.0f * p + 2.0f, 3.0f) * 0.5f);
+    default:                return p;
+  }
+}
+
+static const Rect RECT_EMPTY = { 0, 0, 0, 0 };
+
+static inline bool rEmpty(const Rect &r) { return r.w <= 0 || r.h <= 0; }
+
+static Rect rClamp(float x, float y, float w, float h) {
+  int16_t x0 = (int16_t)floorf(x), y0 = (int16_t)floorf(y);
+  int16_t x1 = (int16_t)ceilf(x + w), y1 = (int16_t)ceilf(y + h);
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > SCREEN_W) x1 = SCREEN_W;
+  if (y1 > SCREEN_H) y1 = SCREEN_H;
+  if (x1 <= x0 || y1 <= y0) return RECT_EMPTY;
+  return Rect{ x0, y0, (int16_t)(x1 - x0), (int16_t)(y1 - y0) };
+}
+
+static Rect rUnion(const Rect &a, const Rect &b) {
+  if (rEmpty(a)) return b;
+  if (rEmpty(b)) return a;
+  int16_t x0 = a.x < b.x ? a.x : b.x;
+  int16_t y0 = a.y < b.y ? a.y : b.y;
+  int16_t x1 = (a.x + a.w) > (b.x + b.w) ? (a.x + a.w) : (b.x + b.w);
+  int16_t y1 = (a.y + a.h) > (b.y + b.h) ? (a.y + a.h) : (b.y + b.h);
+  return Rect{ x0, y0, (int16_t)(x1 - x0), (int16_t)(y1 - y0) };
+}
+
+static bool rHit(const Rect &a, const Rect &b) {
+  if (rEmpty(a) || rEmpty(b)) return false;
+  return !(a.x + a.w <= b.x || b.x + b.w <= a.x ||
+           a.y + a.h <= b.y || b.y + b.h <= a.y);
+}
+
+
+/* =========================================================================
+   4.  FRAMEBUFFER FLUSH
+   ========================================================================= */
+
+void JuniFB::flush() {
+  if (!hasDirty()) return;
+  int16_t x = dx0, y = dy0;
+  int16_t w = dx1 - dx0 + 1, h = dy1 - dy0 + 1;
+  tft.startWrite();
+  tft.setAddrWindow(x, y, w, h);
+  for (int16_t r = 0; r < h; r++)
+    tft.writePixels(&buf[(int32_t)(y + r) * SCREEN_W + x], (uint32_t)w);
+  tft.endWrite();
+  clearDirty();
+}
+
+
+/* =========================================================================
+   5.  ANTIALIASED PRIMITIVES
+   -------------------------------------------------------------------------
+   Everything the panda is made of. Coordinates are floats and edges get
+   real coverage antialiasing, which is what makes the face read as a smooth
+   moulded shape rather than a stack of rounded rectangles -- and it lets
+   the panda scale smoothly during transitions.
+   ========================================================================= */
+
+// Exact per-pixel coverage; used for spans thinner than 2 px.
+static void spanExact(bool vertical, int fixed, float lo, float hi, const Col &c) {
+  int a = (int)floorf(lo - 0.5f), b = (int)ceilf(hi + 0.5f);
+  for (int i = a; i <= b; i++) {
+    float l = lo > ((float)i - 0.5f) ? lo : ((float)i - 0.5f);
+    float r = hi < ((float)i + 0.5f) ? hi : ((float)i + 0.5f);
+    float cov = r - l;
+    if (cov <= 0.004f) continue;
+    if (cov > 1.0f) cov = 1.0f;
+    if (vertical) fb.blend((int16_t)fixed, (int16_t)i, c, (uint8_t)(cov * 255.0f));
+    else          fb.blend((int16_t)i, (int16_t)fixed, c, (uint8_t)(cov * 255.0f));
+  }
+}
+
+// Horizontal span from xl..xr (continuous coords) on row y.
+static void spanAA(float xl, float xr, int y, const Col &c) {
+  if ((uint16_t)y >= SCREEN_H) return;
+  float w = xr - xl;
+  if (w <= 0.0f) return;
+  if (w < 2.0f) { spanExact(false, y, xl, xr, c); return; }
+
+  int iL = (int)ceilf(xl + 0.5f);      // first fully covered pixel
+  int iR = (int)floorf(xr - 0.5f);     // last fully covered pixel
+  if (iR >= iL) fb.hline((int16_t)iL, (int16_t)y, (int16_t)(iR - iL + 1), to565(c));
+
+  float covL = ((float)iL - 0.5f) - xl;
+  if (covL > 0.004f)
+    fb.blend((int16_t)(iL - 1), (int16_t)y, c, (uint8_t)((covL > 1.0f ? 1.0f : covL) * 255.0f));
+  float covR = xr - ((float)iR + 0.5f);
+  if (covR > 0.004f)
+    fb.blend((int16_t)(iR + 1), (int16_t)y, c, (uint8_t)((covR > 1.0f ? 1.0f : covR) * 255.0f));
+}
+
+// Vertical span from yt..yb on column x.
+static void vspanAA(int x, float yt, float yb, const Col &c) {
+  if ((uint16_t)x >= SCREEN_W) return;
+  float h = yb - yt;
+  if (h <= 0.0f) return;
+  if (h < 2.0f) { spanExact(true, x, yt, yb, c); return; }
+
+  int iT = (int)ceilf(yt + 0.5f);
+  int iB = (int)floorf(yb - 0.5f);
+  uint16_t col = to565(c);
+  for (int y = iT; y <= iB; y++) fb.px((int16_t)x, (int16_t)y, col);
+
+  float covT = ((float)iT - 0.5f) - yt;
+  if (covT > 0.004f)
+    fb.blend((int16_t)x, (int16_t)(iT - 1), c, (uint8_t)((covT > 1.0f ? 1.0f : covT) * 255.0f));
+  float covB = yb - ((float)iB + 0.5f);
+  if (covB > 0.004f)
+    fb.blend((int16_t)x, (int16_t)(iB + 1), c, (uint8_t)((covB > 1.0f ? 1.0f : covB) * 255.0f));
+}
+
+/* Superellipse  |x/a|^n + |y/b|^n = 1.
+     n = 2.0 -> ellipse
+     n = 2.2 -> soft organic oval   (the eye patches)
+     n = 2.8 -> squircle            (top of the face)
+     n = 3.6 -> flatter, boxier     (bottom of the face)
+   Separate exponents top/bottom give the face a softly domed top and a
+   slightly flatter bottom -- the "bean" silhouette.
+   `shear` slides each row sideways, tilting the shape organically.        */
+static void fillSuperAA(float cx, float cy, float a, float b,
+                        float nTop, float nBot, float shear, const Col &c) {
+  if (a <= 0.2f || b <= 0.2f) return;
+  int y0 = (int)floorf(cy - b) - 1, y1 = (int)ceilf(cy + b) + 1;
+  for (int y = y0; y <= y1; y++) {
+    float dy = (float)y - cy;
+    float t = fabsf(dy) / b;
+    if (t >= 1.0f) continue;
+    float n = (dy < 0.0f) ? nTop : nBot;
+    float f = 1.0f - powf(t, n);
+    if (f <= 0.0f) continue;
+    float xh = a * powf(f, 1.0f / n);
+    float xc = cx + shear * dy;
+    spanAA(xc - xh, xc + xh, y, c);
+  }
+}
+
+static void fillCircleAA(float cx, float cy, float r, const Col &c) {
+  if (r <= 0.25f) return;
+  int y0 = (int)floorf(cy - r) - 1, y1 = (int)ceilf(cy + r) + 1;
+  for (int y = y0; y <= y1; y++) {
+    float dy = (float)y - cy;
+    float d = r * r - dy * dy;
+    if (d <= 0.0f) continue;
+    float xh = sqrtf(d);
+    spanAA(cx - xh, cx + xh, y, c);
+  }
+}
+
+/* A tapered parabolic stroke. This one primitive draws every curved feature:
+     rise > 0  -> arch, peak in the middle  (sleepy eyes, happy ^ eyes)
+     rise < 0  -> dip,  low in the middle   (smiles, the little "w" mouth)
+     rise ~ 0  -> soft flat line            (neutral mouth, closed eye)
+   The stroke is thickest at the centre and thins toward the tips, which is
+   what stops closed eyes looking like black rectangles.                   */
+static void drawCurveAA(float cx, float cy, float halfW, float rise,
+                        float thick, const Col &c) {
+  if (halfW <= 0.4f || thick <= 0.2f) return;
+  int x0 = (int)floorf(cx - halfW), x1 = (int)ceilf(cx + halfW);
+  for (int x = x0; x <= x1; x++) {
+    float u = ((float)x - cx) / halfW;
+    if (u < -1.0f || u > 1.0f) continue;
+    float u2 = u * u;
+    float y = cy - rise * (1.0f - u2);
+    float k = 1.0f - u2 * u2;
+    float taper = 0.45f + 0.55f * sqrtf(k < 0.0f ? 0.0f : k);
+    float t = thick * taper;
+    vspanAA(x, y - t * 0.5f, y + t * 0.5f, c);
+  }
+}
+
+// Small rounded triangle pointing down: the nose. Wide flat-ish top with
+// softened corners, concave sides, blunt tip.
+static void drawNoseAA(float cx, float topY, float w, float h, const Col &c) {
+  if (w <= 1.0f || h <= 1.0f) return;
+  int y0 = (int)floorf(topY), y1 = (int)ceilf(topY + h);
+  for (int y = y0; y <= y1; y++) {
+    float t = ((float)y - topY) / h;
+    if (t < 0.0f || t > 1.0f) continue;
+    float hw = (w * 0.5f) * powf(1.0f - t, 0.60f);
+    if (t < 0.22f) {                              // round the top corners
+      float u = t / 0.22f;
+      hw *= 0.80f + 0.20f * sqrtf(u);
+    }
+    if (t > 0.78f) {                              // round the tip
+      float u = (t - 0.78f) / 0.22f;
+      float k = 1.0f - u * u;
+      hw *= sqrtf(k < 0.0f ? 0.0f : k);
+    }
+    if (hw < 0.15f) continue;
+    spanAA(cx - hw, cx + hw, y, c);
+  }
+}
+
+// One small 4-point star. Deliberately tiny -- no confetti.
+static void drawSparkleAA(float cx, float cy, float size, float alpha) {
+  if (size < 2.0f || alpha <= 0.02f) return;
+  Col c = { (uint8_t)(255.0f * alpha), (uint8_t)(216.0f * alpha), (uint8_t)(150.0f * alpha) };
+  int s = (int)size;
+  for (int dy = -s; dy <= s; dy++) {
+    float u = fabsf((float)dy) / size;
+    float k = 1.0f - u;
+    float hw = 1.7f * k * k;
+    if (hw > 0.12f) spanAA(cx - hw, cx + hw, (int)(cy + (float)dy), c);
+  }
+  for (int dx = -s; dx <= s; dx++) {
+    float u = fabsf((float)dx) / size;
+    float k = 1.0f - u;
+    float hh = 1.7f * k * k;
+    if (hh > 0.12f) vspanAA((int)(cx + (float)dx), cy - hh, cy + hh, c);
+  }
+  fillCircleAA(cx, cy, 1.3f, c);
+}
+
+
+/* =========================================================================
+   6.  SCREEN LAYOUT
+   -------------------------------------------------------------------------
+   All panda geometry is expressed relative to the face centre at scale 1.0,
+   so the whole face scales from a single multiplier.
+   ========================================================================= */
+
+static const float FACE_CX    = SCREEN_W * 0.5f;
+static const float FACE_HW    = 84.0f;    // half width  -> 168 px wide
+static const float FACE_HH    = 59.0f;    // half height -> 118 px tall
+static const float FACE_N_TOP = 2.75f;    // softly domed top
+static const float FACE_N_BOT = 3.55f;    // slightly flatter bottom
+
+static const float EYE_DX    = 40.0f;     // centre -> each eye
+static const float EYE_DY    = -15.0f;    // upper-middle of the face
+static const float EYE_HW    = 17.0f;     // 34 px wide
+static const float EYE_HH    = 21.0f;     // 42 px tall
+static const float EYE_SHEAR = 0.10f;     // gentle inward tilt
+
+static const float NOSE_DY  = 26.0f;
+static const float NOSE_W   = 13.0f;
+static const float NOSE_H   =  9.0f;
+static const float MOUTH_DY = 42.0f;
+
+static const int16_t DOT_CX = SCREEN_W / 2;
+static const int16_t DOT_CY = 299;
+static const float   DOT_R  = 3.4f;
+
+static const float TIMER_MAX_W = 226.0f;  // auto-shrink guard for "120:00"
+
+
+/* =========================================================================
+   7.  PANDA EXPRESSION DATA
+   ========================================================================= */
+
+static const uint8_t PANDA_NONE = 0xFF;
+
+// ---- IDLE : calm, awake, waiting ---------------------------------------
+static const FaceKey K_IDLE[] = {
+  { 0, 1.00f, EYE_OVAL, MOUTH_W, 0.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- FOCUS : concentrated, eyes a touch narrower, neutral mouth --------
+static const FaceKey K_FOCUS[] = {
+  { 0, 0.88f, EYE_OVAL, MOUTH_FLAT, 0.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- START : "okay, let's focus."  widen, smile, quick blink, settle ---
+static const FaceKey K_START[] = {
+  {   0, 1.00f, EYE_OVAL, MOUTH_W,      0.0f, 1.00f, 0.0f, 0.0f },
+  { 120, 1.12f, EYE_OVAL, MOUTH_SMILE, -2.0f, 1.06f, 0.0f, 0.0f },
+  { 300, 1.10f, EYE_OVAL, MOUTH_SMILE, -3.0f, 1.05f, 0.0f, 0.0f },
+  { 380, 0.05f, EYE_OVAL, MOUTH_SMILE, -2.0f, 1.00f, 0.0f, 0.0f },
+  { 470, 1.05f, EYE_OVAL, MOUTH_SMILE, -1.0f, 1.02f, 0.0f, 0.0f },
+  { 660, 0.92f, EYE_OVAL, MOUTH_FLAT,   0.0f, 1.00f, 0.0f, 0.0f },
+  { 820, 0.88f, EYE_OVAL, MOUTH_FLAT,   0.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- BREAK : eyes ease shut into soft sleepy arcs ----------------------
+static const FaceKey K_BREAK[] = {
+  {   0, 0.88f, EYE_OVAL,   MOUTH_FLAT,  0.0f, 1.00f, 0.0f, 0.0f },
+  { 160, 0.40f, EYE_OVAL,   MOUTH_FLAT,  1.0f, 1.00f, 0.3f, 0.0f },
+  { 300, 0.06f, EYE_OVAL,   MOUTH_SMILE, 2.0f, 1.00f, 0.4f, 0.0f },
+  { 340, 1.00f, EYE_SLEEPY, MOUTH_SMILE, 2.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- WAKE : shut -> half -> open -> tiny blink -> focus ----------------
+static const FaceKey K_WAKE[] = {
+  {   0, 1.00f, EYE_SLEEPY, MOUTH_SMILE,  2.0f, 1.00f, 0.0f, 0.0f },
+  {  60, 0.00f, EYE_OVAL,   MOUTH_SMILE,  1.0f, 1.00f, 0.0f, 0.0f },
+  { 200, 0.55f, EYE_OVAL,   MOUTH_SMILE,  0.0f, 1.00f, 0.0f, 0.0f },
+  { 300, 1.00f, EYE_OVAL,   MOUTH_FLAT,  -1.0f, 1.00f, 0.0f, 0.0f },
+  { 360, 0.10f, EYE_OVAL,   MOUTH_FLAT,   0.0f, 1.00f, 0.0f, 0.0f },
+  { 450, 0.95f, EYE_OVAL,   MOUTH_FLAT,   0.0f, 1.00f, 0.0f, 0.0f },
+  { 520, 0.88f, EYE_OVAL,   MOUTH_FLAT,   0.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- CANCEL : "okay, we're stopping."  Not sad, not cross. -------------
+static const FaceKey K_CANCEL[] = {
+  {   0, 0.88f, EYE_OVAL, MOUTH_FLAT, 0.0f, 1.00f, 0.0f, 0.0f },
+  { 180, 0.72f, EYE_OVAL, MOUTH_FLAT, 1.0f, 1.00f, 0.7f, 0.0f },
+  { 380, 0.62f, EYE_OVAL, MOUTH_DOWN, 2.0f, 1.00f, 1.0f, 0.0f },
+  { 700, 0.62f, EYE_OVAL, MOUTH_DOWN, 2.0f, 1.00f, 1.0f, 0.0f },
+  { 980, 0.72f, EYE_OVAL, MOUTH_FLAT, 1.0f, 1.00f, 0.5f, 0.0f },
+};
+
+// ---- FINISH : happy squint, lift, wink + sparkle, settle happy ---------
+static const FaceKey K_FINISH[] = {
+  {    0, 0.88f, EYE_OVAL,   MOUTH_FLAT,       0.0f, 1.00f, 0.0f, 0.0f },
+  {  140, 0.30f, EYE_OVAL,   MOUTH_SMILE,     -1.0f, 1.00f, 0.0f, 0.0f },
+  {  240, 1.00f, EYE_HAPPY,  MOUTH_BIG_SMILE, -2.0f, 1.00f, 0.0f, 0.0f },
+  {  430, 1.00f, EYE_HAPPY,  MOUTH_BIG_SMILE, -4.0f, 1.00f, 0.0f, 0.0f },
+  {  620, 1.00f, EYE_HAPPY,  MOUTH_BIG_SMILE, -2.0f, 1.00f, 0.0f, 0.0f },
+  {  700, 1.00f, EYE_WINK_R, MOUTH_BIG_SMILE, -2.0f, 1.00f, 0.0f, 0.0f },
+  {  820, 1.00f, EYE_WINK_R, MOUTH_BIG_SMILE, -3.0f, 1.00f, 0.0f, 1.0f },
+  { 1150, 1.00f, EYE_WINK_R, MOUTH_BIG_SMILE, -2.0f, 1.00f, 0.0f, 0.6f },
+  { 1400, 1.00f, EYE_HAPPY,  MOUTH_SMILE,      0.0f, 1.00f, 0.0f, 0.0f },
+};
+
+// ---- WINK : standalone, holds -----------------------------------------
+static const FaceKey K_WINK[] = {
+  {  0, 1.00f, EYE_OVAL,   MOUTH_SMILE, 0.0f, 1.00f, 0.0f, 0.0f },
+  { 90, 1.00f, EYE_WINK_R, MOUTH_SMILE, 0.0f, 1.00f, 0.0f, 0.5f },
+};
+
+#define SEQ(arr, nxt, bl, br) { arr, (uint8_t)(sizeof(arr) / sizeof(FaceKey)), nxt, bl, br }
+
+static const FaceSeq PANDA_SEQ[PANDA_EXPR_COUNT] = {
+  /* PANDA_IDLE   */ SEQ(K_IDLE,   PANDA_NONE,  true,  true ),
+  /* PANDA_BLINK  */ SEQ(K_IDLE,   PANDA_NONE,  true,  true ),   // handled specially
+  /* PANDA_START  */ SEQ(K_START,  PANDA_FOCUS, false, false),
+  /* PANDA_FOCUS  */ SEQ(K_FOCUS,  PANDA_NONE,  true,  true ),
+  /* PANDA_BREAK  */ SEQ(K_BREAK,  PANDA_NONE,  false, true ),
+  /* PANDA_WAKE   */ SEQ(K_WAKE,   PANDA_FOCUS, false, false),
+  /* PANDA_CANCEL */ SEQ(K_CANCEL, PANDA_NONE,  false, false),
+  /* PANDA_FINISH */ SEQ(K_FINISH, PANDA_NONE,  false, true ),
+  /* PANDA_WINK   */ SEQ(K_WINK,   PANDA_NONE,  false, true ),
+};
+
+static FaceState       faceNow    = { 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, EYE_OVAL, MOUTH_W };
+static PandaExpression curExpr    = PANDA_IDLE;
+static unsigned long   seqStart   = 0;
+static bool            seqHolding = false;
+
+void setPandaExpression(PandaExpression e);
+
+
+/* =========================================================================
+   8.  PANDA RENDERER
+   -------------------------------------------------------------------------
+   The ONLY code in the sketch that turns a face into pixels. The state
+   machine never calls anything in here except setPandaExpression().
+
+   To move to professionally rendered sprite frames later, replace the body
+   of drawPanda() with a blit (see the note after it) -- no other part of
+   the sketch needs to change.
+   ========================================================================= */
+
+void drawPandaMouth(float cx, float cy, float s, uint8_t style, const Col &c) {
+  switch (style) {
+    case MOUTH_W:                                     // tiny relaxed "w"
+      drawCurveAA(cx - 5.5f * s, cy, 5.5f * s, -2.6f * s, 2.6f * s, c);
+      drawCurveAA(cx + 5.5f * s, cy, 5.5f * s, -2.6f * s, 2.6f * s, c);
+      break;
+    case MOUTH_SMILE:     drawCurveAA(cx, cy,            10.0f * s, -4.0f * s, 2.8f * s, c); break;
+    case MOUTH_BIG_SMILE: drawCurveAA(cx, cy - 1.0f * s, 13.0f * s, -6.5f * s, 3.3f * s, c); break;
+    case MOUTH_FLAT:      drawCurveAA(cx, cy,             8.0f * s, -0.8f * s, 2.6f * s, c); break;
+    case MOUTH_DOWN:      drawCurveAA(cx, cy + 1.0f * s,  8.5f * s,  2.2f * s, 2.6f * s, c); break;
+  }
+}
+
+void drawPandaEye(float sx, float eyeCy, float s, int side,
+                  const FaceState &f, const Col &hi) {
+  float ea = EYE_HW * s * f.wide;
+  float eb = EYE_HH * s;
+  float shear = (side ? -EYE_SHEAR : EYE_SHEAR);
+
+  uint8_t style = f.eyeStyle;
+  if (style == EYE_WINK_R) style = side ? EYE_HAPPY : EYE_OVAL;
+
+  switch (style) {
+    case EYE_SLEEPY:   // soft shallow arch: peaceful, closed, never a rectangle
+      drawCurveAA(sx, eyeCy + 3.0f * s, ea * 0.95f, 5.0f * s, 4.0f * s, INK);
+      break;
+
+    case EYE_HAPPY:    // deeper arch: happy squint
+      drawCurveAA(sx, eyeCy + 5.0f * s, ea * 1.00f, 9.0f * s, 4.6f * s, INK);
+      break;
+
+    case EYE_OVAL:
+    default: {
+      float open = f.eyeOpen;
+      if (open <= 0.08f) {                       // fully shut mid-blink
+        drawCurveAA(sx, eyeCy, ea * 0.92f, 2.2f * s, 3.4f * s, INK);
+        break;
+      }
+      float b   = eb * open;
+      float ccy = eyeCy + (1.0f - open) * eb * 0.20f;   // lid closes from the top
+      fillSuperAA(sx, ccy, ea, b, 2.15f, 2.45f, shear, INK);
+      if (open > 0.55f) {                        // tiny catchlight
+        float hx = sx + (side ? 1.0f : -1.0f) * ea * 0.30f + f.gazeX * 2.0f * s;
+        float hy = ccy - b * 0.34f + f.gazeY * 2.0f * s;
+        fillCircleAA(hx, hy, 3.5f * s * open, hi);
+      }
+      break;
+    }
+  }
+}
+
+void drawPanda(const FaceRender &r) {
+  if (r.alpha < 0.02f || r.scale < 0.05f) return;
+
+  const FaceState &f = r.f;
+  float s  = r.scale;
+  float cy = r.cy + f.bob;
+  Col face = warmWhite(r.alpha);
+  Col hi   = warmWhite(r.alpha);
+
+  // 1. the white bean face -- no ears, no outline, no body
+  fillSuperAA(r.cx, cy, FACE_HW * s, FACE_HH * s, FACE_N_TOP, FACE_N_BOT, 0.0f, face);
+
+  // 2. the two black eye patches
+  float eyeCy = cy + EYE_DY * s + f.gazeY * 2.0f * s;
+  drawPandaEye(r.cx - EYE_DX * s, eyeCy, s, 0, f, hi);
+  drawPandaEye(r.cx + EYE_DX * s, eyeCy, s, 1, f, hi);
+
+  // 3. nose
+  drawNoseAA(r.cx, cy + NOSE_DY * s, NOSE_W * s, NOSE_H * s, INK);
+
+  // 4. mouth
+  drawPandaMouth(r.cx, cy + MOUTH_DY * s, s, f.mouth, INK);
+
+  // 5. optional single sparkle, clear of the face silhouette
+  if (f.sparkle > 0.02f)
+    drawSparkleAA(r.cx + 92.0f * s, cy - 46.0f * s,
+                  8.0f * s * f.sparkle + 3.0f, f.sparkle * r.alpha);
+}
+
+/* Rendering-backend seam.
+   drawPanda() above is the vector backend. A sprite backend would be:
+
+     void drawPandaSprite(const uint16_t *rgb565, int w, int h, int x, int y);
+
+   ...selected from a small table keyed by (curExpr, frame index). Because the
+   application only ever calls setPandaExpression(), swapping the body of
+   drawPanda() for a sprite blit requires no state-machine changes. Keep
+   pandaBoxOf() in sync with whatever the sprite bounds are.               */
+
+// Bounding box of the panda, with margin. Must enclose everything
+// drawPanda() touches, including the sparkle.
+static Rect pandaBoxOf(const FaceRender &r) {
+  if (r.alpha < 0.02f || r.scale < 0.05f) return RECT_EMPTY;
+  float s  = r.scale;
+  float cy = r.cy + r.f.bob;
+  float hw = FACE_HW * s + 4.0f;
+  float hh = FACE_HH * s + 4.0f;
+  float x0 = r.cx - hw, y0 = cy - hh, x1 = r.cx + hw, y1 = cy + hh;
+  if (r.f.sparkle > 0.02f) {
+    float sx = r.cx + 92.0f * s, sy = cy - 46.0f * s, sr = 8.0f * s + 6.0f;
+    if (sx + sr > x1) x1 = sx + sr;
+    if (sy - sr < y0) y0 = sy - sr;
+  }
+  return rClamp(x0, y0, x1 - x0, y1 - y0);
+}
+
+
+/* =========================================================================
+   9.  TEXT ENGINE
+   -------------------------------------------------------------------------
+   The timer is not "big pixel font". FreeSansBold24pt7b is rendered at
+   textSize 2 into a 1-bit off-screen canvas, then box-filtered DOWN to the
+   target size. Because it is always a downscale, edges get real coverage
+   antialiasing -- smooth numerals -- and the scale can be any float, which
+   is what lets the timer grow and shrink continuously during transitions.
+   ========================================================================= */
+
+#define TXT_W 336
+#define TXT_H  88
+
+static GFXcanvas1 *txtC = nullptr;
+static int16_t txtW = 0, txtH = 0;
+
+static char           prepStr[16] = "";
+static const GFXfont *prepFont    = nullptr;
+static uint8_t        prepSize    = 0;
+static bool           prepTabular = false;
+
+// Renders `s` into the canvas at the origin. `tabular` measures an all-zeros
+// reference string of the same length instead, so a counting clock keeps a
+// rock-steady box and never jitters horizontally.
+static void prepareText(const char *s, const GFXfont *f, uint8_t size, bool tabular) {
+  if (prepFont == f && prepSize == size && prepTabular == tabular &&
+      strcmp(prepStr, s) == 0) return;
+
+  strncpy(prepStr, s, sizeof(prepStr) - 1);
+  prepStr[sizeof(prepStr) - 1] = 0;
+  prepFont = f; prepSize = size; prepTabular = tabular;
+
+  txtC->fillScreen(0);
+  txtC->setFont(f);
+  txtC->setTextSize(size);
+  txtC->setTextColor(1);
+  txtC->setTextWrap(false);
+
+  char ref[16];
+  const char *meas = s;
+  if (tabular) {
+    size_t n = strlen(s);
+    if (n > 15) n = 15;
+    for (size_t i = 0; i < n; i++) ref[i] = (s[i] == ':') ? ':' : '0';
+    ref[n] = 0;
+    meas = ref;
+  }
+
+  int16_t bx, by; uint16_t bw, bh;
+  txtC->getTextBounds(meas, 0, 0, &bx, &by, &bw, &bh);
+  txtC->setCursor(-bx, -by);
+  txtC->print(s);
+
+  txtW = (int16_t)(bw > TXT_W ? TXT_W : bw);
+  txtH = (int16_t)(bh > TXT_H ? TXT_H : bh);
+}
+
+// 4x4 box-filtered blit of the prepared glyph block, centred on (dcx,dcy).
+static void blitTextAA(int16_t sw, int16_t sh, float dcx, float dcy,
+                       float scale, float alpha, const Col &base) {
+  if (sw <= 0 || sh <= 0 || scale <= 0.02f || alpha <= 0.004f) return;
+  int dw = (int)lroundf((float)sw * scale), dh = (int)lroundf((float)sh * scale);
+  if (dw <= 0 || dh <= 0) return;
+
+  int x0 = (int)lroundf(dcx - (float)dw * 0.5f);
+  int y0 = (int)lroundf(dcy - (float)dh * 0.5f);
+
+  const uint8_t *sb = txtC->getBuffer();
+  const int   rowBytes = (TXT_W + 7) / 8;
+  const float inv  = 1.0f / scale;
+  const int   SS   = 4;
+  const float step = inv / (float)SS;
+
+  for (int dy = 0; dy < dh; dy++) {
+    int fy = y0 + dy;
+    if ((uint16_t)fy >= SCREEN_H) continue;
+    float sy = (float)dy * inv;
+    for (int dx = 0; dx < dw; dx++) {
+      int fx = x0 + dx;
+      if ((uint16_t)fx >= SCREEN_W) continue;
+      float sx = (float)dx * inv;
+      int hit = 0;
+      for (int j = 0; j < SS; j++) {
+        int py = (int)(sy + ((float)j + 0.5f) * step);
+        if (py < 0 || py >= sh) continue;
+        const uint8_t *row = sb + (size_t)py * rowBytes;
+        for (int i = 0; i < SS; i++) {
+          int pxi = (int)(sx + ((float)i + 0.5f) * step);
+          if (pxi < 0 || pxi >= sw) continue;
+          if (row[pxi >> 3] & (0x80 >> (pxi & 7))) hit++;
+        }
+      }
+      if (!hit) continue;
+      float cov = ((float)hit / (float)(SS * SS)) * alpha;
+      if (cov > 1.0f) cov = 1.0f;
+      fb.blend((int16_t)fx, (int16_t)fy, base, (uint8_t)(cov * 255.0f));
+    }
+  }
+}
+
+
+/* =========================================================================
+   10.  UI LAYERS
+   ========================================================================= */
+
+static FaceRender  fr;
+static TimerRender tr;
+
+// Reserved for battery / charging / bluetooth later on. Kept as its own
+// render layer so those states can be added without touching anything else.
+void drawStatusDot() {
+  fillCircleAA((float)DOT_CX, (float)DOT_CY, DOT_R, warmWhite(0.80f));
+}
+
+static Rect dotBox() {
+  return rClamp((float)DOT_CX - DOT_R - 2.0f, (float)DOT_CY - DOT_R - 2.0f,
+                DOT_R * 2.0f + 4.0f, DOT_R * 2.0f + 4.0f);
+}
+
+void drawTimer(const TimerRender &t) {
+  blitTextAA(t.w, t.h, FACE_CX, t.cy, t.scale, t.alpha, warmWhite(1.0f));
+}
+
+static Rect timerBoxOf(const TimerRender &t) {
+  if (t.alpha <= 0.004f || t.scale <= 0.02f || t.w <= 0) return RECT_EMPTY;
+  float dw = (float)t.w * t.scale + 6.0f;
+  float dh = (float)t.h * t.scale + 6.0f;
+  return rClamp(FACE_CX - dw * 0.5f, t.cy - dh * 0.5f, dw, dh);
+}
+
+
+/* =========================================================================
+   11.  APPLICATION STATE MACHINE
+   ========================================================================= */
+
+static AppState      state      = IDLE;
+static unsigned long stateEnter = 0;
+
+//                         panda: cy   scale  alpha | timer: cy    scale  alpha
+static const Layout LAYOUT_HOME   = { 116.0f, 1.00f, 1.00f,  234.0f, 0.53f, 1.00f };
+static const Layout LAYOUT_SELECT = {  78.0f, 0.55f, 0.00f,  152.0f, 0.91f, 1.00f };
+static const Layout LAYOUT_CANCEL = { 118.0f, 0.93f, 0.88f,  234.0f, 0.50f, 0.72f };
+
+static Layout        lNow   = LAYOUT_HOME;
+static Layout        lFrom  = LAYOUT_HOME;
+static Layout        lTo    = LAYOUT_HOME;
+static unsigned long lStart = 0;
+static unsigned long lDur   = 0;
+static uint8_t       lEase  = EASE_OUT_CUBIC;
+static bool          lActive = false;
+
+void startTransition(const Layout &to, unsigned long dur, uint8_t ease) {
+  lFrom = lNow; lTo = to;
+  lStart = millis(); lDur = dur; lEase = ease;
+  lActive = (dur > 0);
+  if (!lActive) lNow = to;
+}
+
+// ---- timings -----------------------------------------------------------
+static const uint16_t T_SELECT_IN    = 340;   // panda gives space to the timer
+static const uint16_t T_SELECT_OUT   = 380;   // timeout back to idle
+static const uint16_t T_START_LAYOUT = 420;   // timer shrinks, panda returns
+static const uint16_t T_START_EXPR   = 180;   // ...then the panda reacts
+static const uint16_t T_STARTING     = 700;   // total before FOCUS
+static const uint16_t T_CANCEL       = 1020;
+static const uint16_t T_CANCEL_SHRNK = 620;
+static const uint16_t T_NUM_POP      = 170;   // time-value change animation
+static const uint16_t T_WAKE         = 520;
+static const uint16_t T_FIN_ANIM     = 1400;  // panda celebration
+static const uint16_t T_FIN_FADE_AT  = 1100;  // 00:00 starts fading here
+static const uint16_t T_WELLDONE_IN  = 350;
+static const uint32_t SELECT_TIMEOUT = 5000;
+static const uint32_t LONG_PRESS_MS  = 1500;
+static const uint32_t BLINK_MS       = 240;
+
+// ---- session -----------------------------------------------------------
+static int           focusMinutes     = 25;
+static uint32_t      remainingSeconds = 25UL * 60;
+static unsigned long lastTick         = 0;
+static uint32_t      tickRemainder    = 0;     // sub-second kept across a pause
+static bool          timerHold        = false; // countdown waits for WAKE
+static unsigned long wakeStart        = 0;
+
+// ---- misc flags --------------------------------------------------------
+static unsigned long lastRotateMs   = 0;
+static unsigned long numAnimStart   = 0;
+static bool          numAnimActive  = false;
+static bool          startExprFired = false;
+static bool          cancelShrunk   = false;
+
+// ---- blink / breathe / gaze -------------------------------------------
+static unsigned long  nextBlinkAt = 0, blinkStart = 0;
+static bool           blinking    = false;
+static uint16_t       blinkMin    = 3000, blinkMax = 6000;
+static unsigned long  nextBreathAt = 0, breathStart = 0;
+static const uint16_t BREATH_MS    = 1600;
+static unsigned long  nextGazeAt = 0, gazeStart = 0;
+static int            gazeTarget = 0;
+
+static void scheduleBlink(unsigned long now, uint16_t lo, uint16_t hi) {
+  blinkMin = lo; blinkMax = hi;
+  blinking = false;
+  nextBlinkAt = now + random(lo, hi);
+}
+
+void setPandaExpression(PandaExpression e) {
+  unsigned long now = millis();
+  if (e == PANDA_BLINK) {                 // one-shot blink on the current face
+    blinking = true;
+    blinkStart = now;
+    return;
+  }
+  curExpr = e;
+  seqStart = now;
+  seqHolding = false;
+}
+
+static const char *stateName(AppState s) {
+  switch (s) {
+    case IDLE:        return "IDLE";
+    case TIME_SELECT: return "TIME_SELECT";
+    case STARTING:    return "STARTING";
+    case FOCUS:       return "FOCUS";
+    case BREAK:       return "BREAK";
+    case CANCELING:   return "CANCELING";
+    default:          return "FINISHED";
+  }
+}
+
+void setAppState(AppState s) {
+  unsigned long now = millis();
+  AppState prev = state;
+  state = s;
+  stateEnter = now;
+
+#if JUNI_DEBUG
+  Serial.printf("[JUNI] %s -> %s  (%d min, %lu s left)\n",
+                stateName(prev), stateName(s), focusMinutes,
+                (unsigned long)remainingSeconds);
+#endif
+
+  switch (s) {
+    case IDLE:
+      remainingSeconds = (uint32_t)focusMinutes * 60;
+      setPandaExpression(PANDA_IDLE);
+      startTransition(LAYOUT_HOME,
+                      (prev == TIME_SELECT) ? T_SELECT_OUT : 300,
+                      EASE_IN_OUT_CUBIC);
+      scheduleBlink(now, 1400, 2800);
+      numAnimActive = false;
+      break;
+
+    case TIME_SELECT:
+      startTransition(LAYOUT_SELECT, T_SELECT_IN, EASE_OUT_CUBIC);
+      lastRotateMs = now;
+      break;
+
+    case STARTING:
+      remainingSeconds = (uint32_t)focusMinutes * 60;
+      startExprFired = false;
+      numAnimActive  = false;
+      startTransition(LAYOUT_HOME, T_START_LAYOUT, EASE_OUT_CUBIC);
+      break;
+
+    case FOCUS:
+      // Do not stomp a START or WAKE animation that is still playing --
+      // both auto-advance into PANDA_FOCUS when they finish.
+      if (curExpr != PANDA_START && curExpr != PANDA_WAKE)
+        setPandaExpression(PANDA_FOCUS);
+      if (prev != BREAK) { lastTick = now; tickRemainder = 0; }
+      scheduleBlink(now, 4000, 8000);
+      nextGazeAt = now + random(4000, 9000);
+      startTransition(LAYOUT_HOME, 0, EASE_LINEAR);
+      break;
+
+    case BREAK:
+      tickRemainder = (uint32_t)(now - lastTick);
+      if (tickRemainder > 999) tickRemainder = 999;
+      setPandaExpression(PANDA_BREAK);
+      break;
+
+    case CANCELING:
+      cancelShrunk = false;
+      setPandaExpression(PANDA_CANCEL);
+      break;
+
+    case FINISHED:
+      remainingSeconds = 0;
+      setPandaExpression(PANDA_FINISH);
+      break;
+  }
+}
+
+void updateStateMachine() {
+  unsigned long now = millis();
+
+  switch (state) {
+    case TIME_SELECT:
+      // Idle too long in time select: drift back home without starting.
+      if (now - lastRotateMs >= SELECT_TIMEOUT) setAppState(IDLE);
+      break;
+
+    case STARTING:
+      if (!startExprFired && now - stateEnter >= T_START_EXPR) {
+        startExprFired = true;
+        setPandaExpression(PANDA_START);
+      }
+      if (now - stateEnter >= T_STARTING) setAppState(FOCUS);
+      break;
+
+    case CANCELING:
+      if (!cancelShrunk && now - stateEnter >= T_CANCEL_SHRNK) {
+        cancelShrunk = true;
+        startTransition(LAYOUT_CANCEL, 320, EASE_IN_OUT_CUBIC);
+      }
+      if (now - stateEnter >= T_CANCEL) setAppState(IDLE);
+      break;
+
+    default:
+      break;
+  }
+}
+
+
+/* =========================================================================
+   12.  INPUT
+   ========================================================================= */
+
+static int           lastS1       = HIGH;
+static unsigned long lastDetentMs = 0;
+
+static bool           btnRawLast   = false;
+static bool           btnStable    = false;
+static unsigned long  btnRawChange = 0;
+static unsigned long  btnDownAt    = 0;
+static bool           longFired    = false;
+static const uint16_t BTN_DEBOUNCE = 25;
+
+static void onRotate(int dir) {
+  if (state != IDLE && state != TIME_SELECT) return;
+
+  int m = focusMinutes + dir * 5;
+  if (m < 5)   m = 5;
+  if (m > 120) m = 120;
+  bool changed = (m != focusMinutes);
+  focusMinutes = m;
+  remainingSeconds = (uint32_t)focusMinutes * 60;
+
+  if (state == IDLE) {
+    setAppState(TIME_SELECT);      // the first detent also applies its +/-5
+  } else {
+    lastRotateMs = millis();
+    if (changed) { numAnimStart = millis(); numAnimActive = true; }
+  }
+}
+
+void updateEncoder() {
+  int s1 = digitalRead(ENC_S1);
+  if (s1 == lastS1) return;
+  lastS1 = s1;
+
+  if (s1 != LOW) return;
+  unsigned long now = millis();
+  if (now - lastDetentMs < 4) return;      // contact-bounce guard
+  lastDetentMs = now;
+
+  bool cw = (digitalRead(ENC_S2) == HIGH); // same convention as the original
+#if ENC_INVERT
+  cw = !cw;
+#endif
+  onRotate(cw ? +1 : -1);
+}
+
+static void onShortPress() {
+  switch (state) {
+    case IDLE:
+      setAppState(STARTING);                 // start with whatever is on screen
+      break;
+    case TIME_SELECT:
+      setAppState(STARTING);
+      break;
+    case FOCUS:
+      setAppState(BREAK);
+      break;
+    case BREAK:
+      setPandaExpression(PANDA_WAKE);
+      timerHold = true;
+      wakeStart = millis();
+      setAppState(FOCUS);
+      break;
+    case FINISHED:
+      setAppState(IDLE);
+      break;
+    default:                                 // STARTING / CANCELING ignore input
+      break;
+  }
+}
+
+void updateButton() {
+  unsigned long now = millis();
+  bool raw = (digitalRead(ENC_KEY) == LOW);
+
+  if (raw != btnRawLast) { btnRawLast = raw; btnRawChange = now; }
+
+  if (raw != btnStable && now - btnRawChange >= BTN_DEBOUNCE) {
+    btnStable = raw;
+    if (raw) { btnDownAt = now; longFired = false; }
+    else if (!longFired) onShortPress();
+  }
+
+  // Long press is measured while held, never blocking, and only cancels a
+  // live session. The matching release is swallowed by `longFired`.
+  if (btnStable && !longFired && (state == FOCUS || state == BREAK) &&
+      now - btnDownAt >= LONG_PRESS_MS) {
+    longFired = true;
+    setAppState(CANCELING);
+  }
+}
+
+
+/* =========================================================================
+   13.  COUNTDOWN
+   -------------------------------------------------------------------------
+   Never draws anything. Accumulates in whole seconds so a long render frame
+   cannot lose or drift a tick, and keeps the sub-second remainder across a
+   pause so resuming is exact.
+   ========================================================================= */
+
+void updateTimer() {
+  if (state != FOCUS) return;
+  unsigned long now = millis();
+
+  if (timerHold) {                       // waiting for the WAKE animation
+    if (now - wakeStart < T_WAKE) return;
+    timerHold = false;
+    lastTick  = now - tickRemainder;
+  }
+
+  while (now - lastTick >= 1000) {
+    lastTick += 1000;
+    if (remainingSeconds > 0) remainingSeconds--;
+    if (remainingSeconds == 0) { setAppState(FINISHED); return; }
+  }
+}
+
+
+/* =========================================================================
+   14.  ANIMATION UPDATE
+   ========================================================================= */
+
+static bool          animDue    = false;
+static unsigned long lastAnimMs = 0;
+
+// open -> narrow -> shut -> narrow -> open, 240 ms total
+static float blinkEnvelope(uint32_t t) {
+  if (t <  70) return lerpf(1.00f, 0.35f, (float)t          / 70.0f);
+  if (t < 120) return lerpf(0.35f, 0.00f, (float)(t -  70)  / 50.0f);
+  if (t < 170) return lerpf(0.00f, 0.35f, (float)(t - 120)  / 50.0f);
+  if (t < 240) return lerpf(0.35f, 1.00f, (float)(t - 170)  / 70.0f);
+  return 1.0f;
+}
+
+static float breathOffset(unsigned long now) {
+#if JUNI_BREATHING
+  if ((long)(now - nextBreathAt) >= 0) {
+    breathStart  = now;
+    nextBreathAt = now + random(5200, 8600);
+  }
+  uint32_t t = (uint32_t)(now - breathStart);
+  if (t < BREATH_MS) return -1.5f * sinf(((float)t / (float)BREATH_MS) * (float)PI);
+#endif
+  return 0.0f;
+}
+
+static FaceState faceFromKey(const FaceKey &k) {
+  FaceState f;
+  f.eyeOpen  = k.eyeOpen;
+  f.eyeStyle = k.eyeStyle;
+  f.mouth    = k.mouth;
+  f.bob      = k.bob;
+  f.wide     = k.wide;
+  f.gazeX    = 0.0f;
+  f.gazeY    = k.gazeY;
+  f.sparkle  = k.sparkle;
+  return f;
+}
+
+static void updateLayoutTween(unsigned long now) {
+  if (!lActive) { lNow = lTo; return; }
+  float p = getAnimationProgress(now, lStart, lDur);
+  float e = applyEase(lEase, p);
+  lNow.pandaCy    = lerpf(lFrom.pandaCy,    lTo.pandaCy,    e);
+  lNow.pandaScale = lerpf(lFrom.pandaScale, lTo.pandaScale, e);
+  lNow.pandaAlpha = lerpf(lFrom.pandaAlpha, lTo.pandaAlpha, e);
+  lNow.timerCy    = lerpf(lFrom.timerCy,    lTo.timerCy,    e);
+  lNow.timerScale = lerpf(lFrom.timerScale, lTo.timerScale, e);
+  lNow.timerAlpha = lerpf(lFrom.timerAlpha, lTo.timerAlpha, e);
+  if (p >= 1.0f) { lActive = false; lNow = lTo; }
+}
+
+static void updateFaceSequence(unsigned long now) {
+  const FaceSeq *s = &PANDA_SEQ[curExpr];
+
+  // Walk auto-advance chains (START -> FOCUS etc). Bounded, never recursive.
+  for (int guard = 0; guard < 4; guard++) {
+    uint32_t t = (uint32_t)(now - seqStart);
+    if (t < s->k[s->n - 1].t) break;
+    if (s->next == PANDA_NONE) break;
+    curExpr  = (PandaExpression)s->next;
+    seqStart = now;
+    s = &PANDA_SEQ[curExpr];
+  }
+
+  uint32_t t = (uint32_t)(now - seqStart);
+  const FaceKey &last = s->k[s->n - 1];
+
+  if (t >= last.t) {
+    faceNow    = faceFromKey(last);
+    seqHolding = true;
+  } else {
+    seqHolding = false;
+    uint8_t i = 0;
+    while (i + 1 < s->n && t >= s->k[i + 1].t) i++;
+    const FaceKey &a = s->k[i];
+    const FaceKey &b = s->k[i + 1];
+    float span = (float)(b.t - a.t);
+    float p    = span > 0.0f ? (((float)t - (float)a.t) / span) : 1.0f;
+    float e    = applyEase(EASE_SMOOTHSTEP, clamp01(p));
+
+    faceNow = faceFromKey(a);                 // enums step at the earlier key
+    faceNow.eyeOpen = lerpf(a.eyeOpen, b.eyeOpen, e);
+    faceNow.bob     = lerpf(a.bob,     b.bob,     e);
+    faceNow.wide    = lerpf(a.wide,    b.wide,    e);
+    faceNow.gazeY   = lerpf(a.gazeY,   b.gazeY,   e);
+    faceNow.sparkle = lerpf(a.sparkle, b.sparkle, e);
+  }
+
+  // ---- modifiers, layered on top of whatever the base expression is ----
+
+  if (s->blink && seqHolding && faceNow.eyeStyle == EYE_OVAL) {
+    if (!blinking && (long)(now - nextBlinkAt) >= 0) { blinking = true; blinkStart = now; }
+    if (blinking) {
+      uint32_t bt = (uint32_t)(now - blinkStart);
+      if (bt >= BLINK_MS) { blinking = false; nextBlinkAt = now + random(blinkMin, blinkMax); }
+      else faceNow.eyeOpen *= blinkEnvelope(bt);
+    }
+  } else {
+    blinking = false;
+  }
+
+  if (s->breathe && seqHolding) faceNow.bob += breathOffset(now);
+
+  // Occasional 1-2 px gaze drift while focusing, then back to centre.
+  if (state == FOCUS && seqHolding && faceNow.eyeStyle == EYE_OVAL) {
+    if ((long)(now - nextGazeAt) >= 0) {
+      gazeStart  = now;
+      gazeTarget = (int)random(-1, 2);
+      nextGazeAt = now + random(5000, 11000);
+    }
+    uint32_t gt = (uint32_t)(now - gazeStart);
+    if (gt < 1500)
+      faceNow.gazeX += (float)gazeTarget * sinf(((float)gt / 1500.0f) * (float)PI);
+  }
+}
+
+void updateAnimation() {
+  unsigned long now = millis();
+  if (now - lastAnimMs < FRAME_MS) return;
+  lastAnimMs = now;
+  animDue = true;
+
+  updateLayoutTween(now);
+  updateFaceSequence(now);
+}
+
+
+/* =========================================================================
+   15.  RENDER ORCHESTRATION
+   -------------------------------------------------------------------------
+   Per frame: work out what each layer should look like, hash it, redraw only
+   the layers whose hash changed, and push only the union of the affected
+   rectangles. The framebuffer persists, so an unchanged layer costs nothing.
+   ========================================================================= */
+
+static Rect     lastBox[L_COUNT] = { RECT_EMPTY, RECT_EMPTY, RECT_EMPTY };
+static uint32_t lastSig[L_COUNT] = { 0, 0, 0 };
+
+static void formatTimeStr(char *out, size_t n) {
+  if (state == IDLE || state == TIME_SELECT) snprintf(out, n, "%02d:00", focusMinutes);
+  else snprintf(out, n, "%02lu:%02lu",
+                (unsigned long)(remainingSeconds / 60),
+                (unsigned long)(remainingSeconds % 60));
+}
+
+static void computeFaceRender(FaceRender &r) {
+  r.cx    = FACE_CX;
+  r.cy    = lNow.pandaCy;
+  r.scale = lNow.pandaScale;
+  r.alpha = lNow.pandaAlpha;
+  r.f     = faceNow;
+}
+
+static void computeTimerRender(TimerRender &t) {
+  unsigned long now = millis();
+  const GFXfont *font = &FreeSansBold24pt7b;
+  uint8_t size    = 2;
+  bool    tabular = true;
+  float   cy    = lNow.timerCy;
+  float   scale = lNow.timerScale;
+  float   alpha = lNow.timerAlpha;
+  char    s[16];
+
+  if (state == FINISHED) {
+    uint32_t e = (uint32_t)(now - stateEnter);
+    if (e >= T_FIN_ANIM) {
+      // "Well Done!" takes the timer's place. Kept smaller than the panda.
+      strncpy(s, "Well Done!", sizeof(s) - 1);
+      s[sizeof(s) - 1] = 0;
+      font = &FreeSansBold12pt7b;
+      size = 2;
+      tabular = false;
+      scale = 0.80f;
+      alpha = clamp01((float)(e - T_FIN_ANIM) / (float)T_WELLDONE_IN);
+    } else {
+      strncpy(s, "00:00", sizeof(s) - 1);
+      s[sizeof(s) - 1] = 0;
+      if (e > T_FIN_FADE_AT)
+        alpha = 1.0f - clamp01((float)(e - T_FIN_FADE_AT) /
+                               (float)(T_FIN_ANIM - T_FIN_FADE_AT));
+    }
+  } else {
+    formatTimeStr(s, sizeof(s));
+
+    // Value-change animation in time select: quick grow + fade-in + settle.
+    if (state == TIME_SELECT && numAnimActive) {
+      float p = getAnimationProgress(now, numAnimStart, T_NUM_POP);
+      float e = applyEase(EASE_OUT_CUBIC, p);
+      scale *= lerpf(0.90f, 1.00f, e);
+      alpha *= lerpf(0.40f, 1.00f, e);
+      cy    += lerpf(6.0f,  0.0f,  e);
+      if (p >= 1.0f) numAnimActive = false;
+    }
+  }
+
+  prepareText(s, font, size, tabular);
+
+  if (txtW > 0 && (float)txtW * scale > TIMER_MAX_W) scale = TIMER_MAX_W / (float)txtW;
+
+  strncpy(t.str, s, sizeof(t.str) - 1);
+  t.str[sizeof(t.str) - 1] = 0;
+  t.cy = cy; t.scale = scale; t.alpha = alpha;
+  t.w = txtW; t.h = txtH;
+}
+
+static inline uint32_t mixh(uint32_t h, uint32_t v) { return (h * 16777619u) ^ v; }
+static inline uint32_t qz(float v, float step) { return (uint32_t)(int32_t)lroundf(v / step); }
+
+static uint32_t faceSig(const FaceRender &r) {
+  uint32_t h = 2166136261u;
+  h = mixh(h, qz(r.cy, 0.25f));
+  h = mixh(h, qz(r.scale, 0.004f));
+  h = mixh(h, qz(r.alpha, 0.008f));
+  h = mixh(h, qz(r.f.eyeOpen, 0.02f));
+  h = mixh(h, r.f.eyeStyle);
+  h = mixh(h, r.f.mouth);
+  h = mixh(h, qz(r.f.bob, 0.25f));
+  h = mixh(h, qz(r.f.wide, 0.01f));
+  h = mixh(h, qz(r.f.gazeX, 0.20f));
+  h = mixh(h, qz(r.f.gazeY, 0.05f));
+  h = mixh(h, qz(r.f.sparkle, 0.03f));
+  return h;
+}
+
+static uint32_t timerSig(const TimerRender &t) {
+  uint32_t h = 2166136261u;
+  for (const char *p = t.str; *p; p++) h = mixh(h, (uint8_t)*p);
+  h = mixh(h, qz(t.cy, 0.25f));
+  h = mixh(h, qz(t.scale, 0.003f));
+  h = mixh(h, qz(t.alpha, 0.008f));
+  h = mixh(h, (uint32_t)t.w);
+  return h;
+}
+
+static uint32_t dotSig() { return 0xD07u; }   // static for now, by design
+
+static void drawLayer(uint8_t i) {
+  switch (i) {
+    case L_PANDA: drawPanda(fr);   break;
+    case L_TIMER: drawTimer(tr);   break;
+    case L_DOT:   drawStatusDot(); break;
+  }
+}
+
+static Rect boxOfLayer(uint8_t i) {
+  switch (i) {
+    case L_PANDA: return pandaBoxOf(fr);
+    case L_TIMER: return timerBoxOf(tr);
+    default:      return dotBox();
+  }
+}
+
+void renderIfNeeded() {
+  if (!animDue) return;
+  animDue = false;
+
+  computeFaceRender(fr);
+  computeTimerRender(tr);
+
+  uint32_t sig[L_COUNT]  = { faceSig(fr), timerSig(tr), dotSig() };
+  Rect     want[L_COUNT] = { boxOfLayer(L_PANDA), boxOfLayer(L_TIMER), boxOfLayer(L_DOT) };
+  Rect     span[L_COUNT];
+  bool     dirty[L_COUNT];
+
+  for (uint8_t i = 0; i < L_COUNT; i++) {
+    dirty[i] = (sig[i] != lastSig[i]);
+    span[i]  = rUnion(lastBox[i], want[i]);
+  }
+
+  // If a dirty layer's span touches a clean layer, that clean layer has to be
+  // redrawn too -- otherwise erasing would punch a hole in it.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (uint8_t i = 0; i < L_COUNT; i++) {
+      if (!dirty[i]) continue;
+      for (uint8_t j = 0; j < L_COUNT; j++) {
+        if (dirty[j] || i == j) continue;
+        if (rHit(span[i], span[j])) { dirty[j] = true; changed = true; }
+      }
+    }
+  }
+
+  bool any = false;
+  for (uint8_t i = 0; i < L_COUNT; i++) if (dirty[i]) { any = true; break; }
+  if (!any) return;
+
+  fb.clearDirty();
+  for (uint8_t i = 0; i < L_COUNT; i++) if (dirty[i]) fb.fillRectR(span[i], 0x0000);
+  for (uint8_t i = 0; i < L_COUNT; i++) if (dirty[i]) drawLayer(i);
+  for (uint8_t i = 0; i < L_COUNT; i++) if (dirty[i]) { lastBox[i] = want[i]; lastSig[i] = sig[i]; }
+
+  fb.flush();
+}
+
+// One-time full paint at boot. The only place fillScreen() is ever used.
+static void fullRepaint() {
+  unsigned long now = millis();
+  updateLayoutTween(now);
+  updateFaceSequence(now);
+  computeFaceRender(fr);
+  computeTimerRender(tr);
+
+  fb.clearDirty();
+  fb.fillScreen(0x0000);
+  for (uint8_t i = 0; i < L_COUNT; i++) {
+    lastBox[i] = boxOfLayer(i);
+    drawLayer(i);
+  }
+  lastSig[L_PANDA] = faceSig(fr);
+  lastSig[L_TIMER] = timerSig(tr);
+  lastSig[L_DOT]   = dotSig();
+  fb.flush();
+}
+
+
+/* =========================================================================
+   16.  SETUP / LOOP
+   ========================================================================= */
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // ---------- display (unchanged from the working configuration) ---------
+  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
+  tft.init(240, 320);
+  tft.setRotation(0);
+  tft.setSPISpeed(TFT_SPI_HZ);
+  // Many ST7789 panels ship in inverted mode; without this, black reads cyan.
+  tft.invertDisplay(true);
+  tft.fillScreen(ST77XX_BLACK);
+
+  // ---------- encoder ----------
+  pinMode(ENC_S1,  INPUT_PULLUP);
+  pinMode(ENC_S2,  INPUT_PULLUP);
+  pinMode(ENC_KEY, INPUT_PULLUP);
+  lastS1     = digitalRead(ENC_S1);
+  btnRawLast = (digitalRead(ENC_KEY) == LOW);
+  btnStable  = btnRawLast;
+
+  randomSeed((unsigned long)esp_random());
+
+  // ---------- offscreen buffers ----------
+  if (!fb.begin()) {
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(10, 40);
+    tft.print("FB alloc failed");
+    Serial.println("[JUNI] framebuffer allocation failed");
+    while (true) delay(1000);
+  }
+  txtC = new GFXcanvas1(TXT_W, TXT_H);
+  if (!txtC || !txtC->getBuffer()) {
+    Serial.println("[JUNI] text canvas allocation failed");
+    while (true) delay(1000);
+  }
+
+  Serial.printf("[JUNI] framebuffer %u B, psram free %u, heap free %u\n",
+                (unsigned)(SCREEN_W * SCREEN_H * 2),
+                (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+
+  // ---------- initial state ----------
+  remainingSeconds = (uint32_t)focusMinutes * 60;
+  lNow = lTo = lFrom = LAYOUT_HOME;
+  state = IDLE;
+  stateEnter = millis();
+  setPandaExpression(PANDA_IDLE);
+  scheduleBlink(millis(), 1200, 2200);
+  nextBreathAt = millis() + 3000;
+
+  fullRepaint();
+  Serial.println("[JUNI] ready");
+}
+
+void loop() {
+  updateEncoder();        // rotation -> time selection
+  updateButton();         // short press / long press
+  updateTimer();          // countdown, drawing-free
+  updateStateMachine();   // timed state transitions
+  updateAnimation();      // layout tween + face keyframes (self-gated ~33 fps)
+  renderIfNeeded();       // dirty-layer redraw + partial flush
+}
