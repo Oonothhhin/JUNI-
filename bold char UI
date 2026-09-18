@@ -1,0 +1,373 @@
+// juni_ui.h — JUNI visual layer, Option C (bold character), warm-orange world. Supersedes juni_idle.h.
+// All seven states, nine expressions, three props, transitions and idle behaviours.
+// Draws into a 240x320 RGB565 framebuffer, anti-aliased via signed-distance coverage.
+// No dependencies beyond <stdint.h> <math.h> <string.h> <stdio.h>.
+//
+// It does NOT own any logic. Your state machine tells it which state it is in; it paints.
+//
+//   JuniUI ui;
+//   ui.drawText = [](uint16_t* fb, const char* s, int cx, int cy, int px, uint16_t col, uint16_t colonCol){ ... };
+//   ui.enter(JuniUI::IDLE, millis());
+//
+//   on state change:      ui.enter(newState, millis());
+//   on encoder detent:    ui.bump(millis(), +1 /* cw */ or -1);
+//   each frame (~30 fps): ui.render(fb, millis(), selectedMinutes, remainingSeconds);
+//
+// drawText: draw `s` centred at (cx,cy) at `px` pixel height, Manrope 700 tabular (or your nearest).
+// If `colonCol` differs from `col`, draw the ':' in colonCol (focus-state colon pulse). Ignoring it is fine.
+//
+// Panel note: this UI is authored for NORMAL (non-inverted) RGB colors.
+// The Arduino sketch that accompanies this file calls tft.invertDisplay(false).
+
+#pragma once
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+class JuniUI {
+public:
+  enum State { IDLE, TIME_SELECT, STARTING, FOCUS, BREAK, CANCELING, FINISHED };
+  static constexpr int W = 240, H = 320;
+
+  // ---------- colour world (edit these to change world) ----------
+  // Match the current juni_well_done / juni_idle look:
+  // black + white + ONE vivid warm-orange accent.
+  static constexpr uint32_t ACCENT  = 0xFF8A1F;  // timer, pill text, status dot
+  static constexpr uint32_t PROP    = 0xFF8A1F;  // headband, mask, shades (same accent; no extra blue)
+  static constexpr uint32_t PILL_BG = 0x351700;  // deep warm brown/orange
+  static constexpr uint32_t GOLD    = 0xFFFFFF;  // finish sparkles stay white
+  static constexpr uint32_t WHITE = 0xFFFFFF, BLACK = 0x000000;
+
+  void (*drawText)(uint16_t* fb, const char* s, int cx, int cy, int px, uint16_t col, uint16_t colonCol) = nullptr;
+
+  // ---------- pose: everything the renderer needs, all interpolable ----------
+  struct Pose {
+    float faceY = 110, faceScale = 1, faceAlpha = 1, faceDy = 0;
+    float lid = 0;            // 0 open … 1 closed (top lid down)
+    float pupilR = 22, gazeX = 0, gazeY = 0;
+    float mouth = 1;          // 0 flat, 1 small smile, 2 big smile, 3 soft (break)
+    float timerPx = 56, timerY = 234, timerAlpha = 1;
+    float pillAlpha = 1;
+    float prop = 0;           // 0 none 1 headband 2 mask 3 shades (integer)
+    float propT = 0;          // 0 off-screen … 1 on
+    float wink = 0, sparkle = 0;
+  };
+
+  void enter(State s, uint32_t now) {
+    prevState = state; state = s; tState = now;
+    from = cur;                       // transition starts from what is on screen now
+    dur = transitionMs(prevState, s);
+    if (s == IDLE && prevState == IDLE) { cur = target(IDLE, 0); from = cur; }
+    nextBlink = now + rnd(4000, 7000); blinkStart = 0;
+    nextGaze = now;                   // pick a fresh gaze target
+  }
+  void bump(uint32_t now, int dir) { bumpStart = now; bumpDir = dir; }
+
+  void render(uint16_t* fb, uint32_t now, int selectedMinutes, int remainingSeconds) {
+    uint32_t t = now - tState;
+    Pose tgt = target(state, t);
+    float k = dur ? easeOut((float)t / dur) : 1;
+    cur = lerpPose(from, tgt, k);
+    behaviour(now, t);
+
+    memset(fb, 0, W * H * 2);
+    drawFace(fb);
+    drawInfo(fb, now, t, selectedMinutes, remainingSeconds);
+  }
+
+private:
+  State state = IDLE, prevState = IDLE;
+  uint32_t tState = 0, dur = 0, nextBlink = 0, blinkStart = 0, gazeStart = 0, nextGaze = 0, bumpStart = 0;
+  int bumpDir = 0;
+  Pose from, cur;
+  float blink = 0, breath = 0, gX = 0, gY = 0, gFromX = 0, gFromY = 0, gToX = 0, gToY = 0;
+  uint32_t seed = 0x9E3779B9u;
+
+  uint32_t rnd(uint32_t lo, uint32_t hi) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return lo + seed % (hi - lo + 1); }
+  static float clamp01(float t) { return t < 0 ? 0 : t > 1 ? 1 : t; }
+  static float easeOut(float t) { t = clamp01(t); return 1 - (1 - t) * (1 - t) * (1 - t); }
+  static float easeIn(float t) { t = clamp01(t); return t * t * t; }
+  static float easeInOut(float t) { t = clamp01(t); return t < .5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2; }
+  static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+  static float seg(uint32_t t, uint32_t a, uint32_t b) { return t <= a ? 0 : t >= b ? 1 : (float)(t - a) / (b - a); }
+
+  static uint32_t transitionMs(State a, State b) {
+    switch (b) {
+      case TIME_SELECT: return 260;
+      case STARTING:    return 280;
+      case FOCUS:       return a == BREAK ? 350 : a == STARTING ? 170 : 240;
+      case BREAK:       return 240;
+      case CANCELING:   return 200;
+      case FINISHED:    return 0;     // keyframed inside target()
+      default:          return 300;   // IDLE
+    }
+  }
+
+  // The visual target for a state, t ms after entering it (keyframed states animate here).
+  Pose target(State s, uint32_t t) {
+    Pose p;
+    switch (s) {
+      case IDLE: break;
+      case TIME_SELECT:
+        p.faceY = 52; p.faceScale = .48f; p.faceAlpha = .6f; p.gazeY = 6;
+        p.timerPx = 76; p.timerY = 176; p.pillAlpha = 0; break;
+      case STARTING: {
+        float k = easeOut(seg(t, 280, 480));          // 280 ms after entry: eyes widen, headband slides on
+        p.pupilR = lerp(22, 24, k); p.mouth = lerp(1, 2, k); p.faceDy = -3 * k;
+        p.prop = 1; p.propT = k; break; }
+      case FOCUS:
+        p.lid = .10f; p.pupilR = 20; p.gazeY = 2; p.mouth = 0; p.prop = 1; p.propT = 1; break;
+      case BREAK:
+        p.lid = .10f; p.mouth = 3; p.faceDy = 2; p.timerAlpha = .6f; p.prop = 2; p.propT = 1; break;
+      case CANCELING:
+        p.lid = .12f; p.gazeX = -2; p.gazeY = 4; p.faceDy = 3; p.mouth = 0; p.timerAlpha = .3f; break;
+      case FINISHED: {
+        float lift = easeOut(seg(t, 200, 500));
+        p.pupilR = 22; p.gazeY = -4 * lift; p.faceDy = -6 * lift; p.mouth = lerp(0, 2, lift);
+        p.timerAlpha = 1;                              // text swaps to "+N min" in drawInfo at 500 ms
+        p.wink = t < 700 ? 0 : t < 800 ? easeIn(seg(t, 700, 800)) : t < 900 ? 1 - easeOut(seg(t, 800, 900)) : 0;
+        float sh = easeOut(seg(t, 900, 1150));
+        p.prop = 3; p.propT = sh;
+        p.sparkle = t < 900 ? 0 : t < 1150 ? 1.15f * easeOut(seg(t, 900, 1150)) : lerp(1.15f, .85f, easeOut(seg(t, 1150, 1300)));
+        p.lid = 0; break; }
+    }
+    return p;
+  }
+  static Pose lerpPose(const Pose& a, const Pose& b, float k) {
+    Pose p;
+    p.faceY = lerp(a.faceY, b.faceY, k); p.faceScale = lerp(a.faceScale, b.faceScale, k);
+    p.faceAlpha = lerp(a.faceAlpha, b.faceAlpha, k); p.faceDy = lerp(a.faceDy, b.faceDy, k);
+    p.lid = lerp(a.lid, b.lid, k); p.pupilR = lerp(a.pupilR, b.pupilR, k);
+    p.gazeX = lerp(a.gazeX, b.gazeX, k); p.gazeY = lerp(a.gazeY, b.gazeY, k);
+    p.mouth = lerp(a.mouth, b.mouth, k);
+    p.timerPx = lerp(a.timerPx, b.timerPx, k); p.timerY = lerp(a.timerY, b.timerY, k);
+    p.timerAlpha = lerp(a.timerAlpha, b.timerAlpha, k); p.pillAlpha = lerp(a.pillAlpha, b.pillAlpha, k);
+    // Props: a prop change slides the old one out then the new one in.
+    if (a.prop == b.prop) { p.prop = b.prop; p.propT = lerp(a.propT, b.propT, k); }
+    else if (k < .5f)      { p.prop = a.prop; p.propT = a.propT * (1 - k * 2); }
+    else                   { p.prop = b.prop; p.propT = b.propT * (k * 2 - 1); }
+    p.wink = b.wink; p.sparkle = b.sparkle;
+    return p;
+  }
+
+  // ---------- ambient behaviour ----------
+  void behaviour(uint32_t now, uint32_t t) {
+    float amp = state == BREAK ? 3 : state == FOCUS ? 1 : state == TIME_SELECT || state == CANCELING ? 0 : 1.5f;
+    float per = state == BREAK ? 5000 : 4000;
+    breath = amp * sinf(6.2831853f * (now % (uint32_t)per) / per);
+
+    bool canBlink = (state == IDLE || state == FOCUS || state == FINISHED) && t > 400;
+    if (canBlink && blinkStart == 0 && now >= nextBlink) blinkStart = now;
+    if (blinkStart) {
+      uint32_t b = now - blinkStart;
+      if      (b < 60)  blink = easeIn(b / 60.f);
+      else if (b < 100) blink = 1;
+      else if (b < 220) blink = 1 - easeOut((b - 100) / 120.f);
+      else { blink = 0; blinkStart = 0;
+             nextBlink = now + (rnd(0, 9) == 0 ? 180 : state == FOCUS ? rnd(8000, 14000) : rnd(4000, 7000)); }
+    } else blink = 0;
+
+    float range = state == FOCUS ? 1 : state == IDLE || state == FINISHED ? 4 : 0;
+    if (now >= nextGaze) {
+      gFromX = gX; gFromY = gY;
+      gToX = range ? (int)rnd(0, (uint32_t)(range * 2)) - range : 0;
+      gToY = range ? ((int)rnd(0, (uint32_t)(range * 2)) - range) * .75f : 0;
+      gazeStart = now; nextGaze = now + (state == FOCUS ? rnd(6000, 10000) : rnd(3000, 6000));
+    }
+    float g = easeInOut((now - gazeStart) / 400.f);
+    gX = lerp(gFromX, gToX, g); gY = lerp(gFromY, gToY, g);
+  }
+
+  // ---------- character ----------
+  static constexpr float EYE_W = 72, EYE_H = 84, EYE_R = 36, EYE_DX = 48;
+  void drawFace(uint16_t* fb) {
+    const Pose& p = cur;
+    float s = p.faceScale, a = p.faceAlpha;
+    float cy = p.faceY + (p.faceDy + breath) * s;
+    float w = EYE_W * s, hFull = EYE_H * s, r = EYE_R * s;
+    float lid = fmaxf(p.lid, blink);
+    bool maskOn = p.prop == 2 && p.propT > .5f;
+
+    for (int i = 0; i < 2; i++) {
+      float cx = 120 + (i ? EYE_DX : -EYE_DX) * s;
+      float lidE = i ? fmaxf(lid, p.wink) : lid;
+      if (maskOn) continue;                                  // eyes are under the mask
+      if (lidE > .9f) {                                      // closed: soft white arc
+        quadStroke(fb, cx - 14 * s, cy - 2 * s, cx, cy + 8 * s, cx + 14 * s, cy - 2 * s, 4 * s, WHITE, a);
+        continue;
+      }
+      float h = hFull * (1 - lidE); if (h < 4 * s) h = 4 * s;
+      float top = cy - hFull / 2 + (hFull - h);
+      float rr = fminf(r, h / 2);
+      roundRect(fb, cx - w / 2, top, w, h, rr, WHITE, a);
+      float px = cx + (p.gazeX + gX) * s, py = cy + (p.gazeY + gY) * s, pr = p.pupilR * s;
+      circleClip(fb, px, py, pr, BLACK, a, cx - w / 2, top, w, h, rr);
+      circleClip(fb, px - 7 * s, py - 8 * s, 6 * s, WHITE, a, cx - w / 2, top, w, h, rr);
+      circleClip(fb, px + 6 * s, py + 7 * s, 2.5f * s, WHITE, a, cx - w / 2, top, w, h, rr);
+    }
+
+    // Mouth at (120, faceY+60), shape blends: flat → small smile → big smile; 3 = soft arc (break).
+    float my = cy + 60 * s, mw = 3 * s;
+    if (p.mouth >= 2.5f) {
+      quadStroke(fb, 120 - 7 * s, my - 2 * s, 120, my + 2 * s, 120 + 7 * s, my - 2 * s, mw, WHITE, a);
+    } else {
+      float m = clamp01(p.mouth), big = clamp01(p.mouth - 1);
+      float hw = lerp(7, 11, big) * s, dip = lerp(0, 5, m) * s + lerp(0, 4, big) * s, mid = lerp(0, 3, big) * s;
+      if (big > 0) mw = lerp(3, 4, big) * s;
+      quadStroke(fb, 120 - hw, my, 120 - hw / 2, my + dip, 120, my + mid, mw, WHITE, a);
+      quadStroke(fb, 120, my + mid, 120 + hw / 2, my + dip, 120 + hw, my, mw, WHITE, a);
+    }
+
+    // Props slide in from above the head.
+    if (p.prop > 0 && p.propT > 0) {
+      float k = easeOut(p.propT), off = -40 * (1 - k) * s, pa = a * k;
+      if (p.prop == 1) headband(fb, cy, s, off, pa);
+      else if (p.prop == 2) sleepMask(fb, cy, s, off, pa);
+      else shades(fb, cy, s, off, pa);
+    }
+    if (p.sparkle > 0) {
+      sparkle(fb, 216, cy - 50 * s, 7 * p.sparkle * s, GOLD, a);
+      sparkle(fb, 26, cy + 40 * s, 5 * p.sparkle * s, GOLD, a);
+    }
+  }
+
+  void headband(uint16_t* fb, float cy, float s, float off, float a) {
+    float y = cy - 56 * s + off;
+    roundRect(fb, 120 - 96 * s, y - 9 * s, 192 * s, 18 * s, 9 * s, PROP, a);
+    capsule(fb, 214 * s + 120 - 120 * s, y, 230 * s + 120 - 120 * s, y - 12 * s, 3.5f * s, PROP, a);
+    capsule(fb, 214 * s + 120 - 120 * s, y, 232 * s + 120 - 120 * s, y + 6 * s, 3.5f * s, PROP, a);
+  }
+  void sleepMask(uint16_t* fb, float cy, float s, float off, float a) {
+    float y = cy + off;
+    roundRect(fb, 120 - 102 * s, y - 34 * s, 204 * s, 68 * s, 34 * s, PROP, a);
+    for (int i = 0; i < 2; i++) {
+      float cx = 120 + (i ? EYE_DX : -EYE_DX) * s;
+      quadStroke(fb, cx - 12 * s, y - 2 * s, cx, y + 8 * s, cx + 12 * s, y - 2 * s, 4 * s, WHITE, a);
+    }
+    quadStroke(fb, 120 - 102 * s, y, 120 - 114 * s, y - 18 * s, 120 - 114 * s, y - 38 * s, 5 * s, PROP, a);
+    quadStroke(fb, 120 + 102 * s, y, 120 + 114 * s, y - 18 * s, 120 + 114 * s, y - 38 * s, 5 * s, PROP, a);
+  }
+  void shades(uint16_t* fb, float cy, float s, float off, float a) {
+    float y = cy + off;
+    for (int i = 0; i < 2; i++) {
+      float cx = 120 + (i ? EYE_DX : -EYE_DX) * s;
+      roundRect(fb, cx - 33 * s, y - 22 * s, 66 * s, 44 * s, 16 * s, PROP, a);
+      capsule(fb, cx - 17 * s, y + 14 * s, cx - 3 * s, y - 16 * s, 2.5f * s, WHITE, a * .7f);
+    }
+    roundRect(fb, 120 - 17 * s, y - 8 * s, 34 * s, 8 * s, 4 * s, PROP, a);
+    roundRect(fb, 120 - 106 * s, y - 12 * s, 26 * s, 8 * s, 4 * s, PROP, a);
+    roundRect(fb, 120 + 80 * s, y - 12 * s, 26 * s, 8 * s, 4 * s, PROP, a);
+  }
+  void sparkle(uint16_t* fb, float cx, float cy, float r, uint32_t col, float a) {
+    capsule(fb, cx, cy - r, cx, cy + r, r * .22f, col, a);
+    capsule(fb, cx - r, cy, cx + r, cy, r * .22f, col, a);
+  }
+
+  // ---------- timer, pill, dot ----------
+  void drawInfo(uint16_t* fb, uint32_t now, uint32_t t, int minutes, int remaining) {
+    const Pose& p = cur;
+    char buf[12]; const char* pillText = "Ready";
+    float ta = p.timerAlpha, tpx = p.timerPx, ty = p.timerY;
+    uint16_t col, colon;
+
+    switch (state) {
+      case IDLE: case TIME_SELECT: snprintf(buf, sizeof buf, "%d:00", minutes); break;
+      case STARTING: case FOCUS: case BREAK: case CANCELING:
+        snprintf(buf, sizeof buf, "%d:%02d", remaining / 60, remaining % 60);
+        pillText = state == BREAK ? "Break" : "Focusing"; break;
+      case FINISHED:
+        if (t < 500) { snprintf(buf, sizeof buf, "0:00"); ta = 1 - easeIn(seg(t, 200, 500)); }
+        else { snprintf(buf, sizeof buf, "+%d min", minutes); tpx = 44; ta = easeOut(seg(t, 500, 700)); }
+        pillText = "Well done!"; break;
+    }
+    if (state == CANCELING) pillText = prevState == BREAK ? "Break" : "Focusing";
+
+    // Detent pop: 1.06x scale and a 4 px slide in the rotation direction over 120 ms.
+    if (state == TIME_SELECT && bumpStart && now - bumpStart < 120) {
+      float k = (now - bumpStart) / 120.f;
+      tpx *= 1 + .06f * sinf(k * 3.14159f);
+      ty += bumpDir * 4 * (1 - easeOut(k));
+    }
+
+    col = rgb565(blend(ACCENT, BLACK, ta));
+    colon = col;
+    if (state == FOCUS) {                                   // colon pulse 1 → 0.35, 1 s period on the second boundary
+      float ph = (now % 1000) / 1000.f, ca = ph < .5f ? lerp(1, .35f, easeInOut(ph * 2)) : lerp(.35f, 1, easeInOut((ph - .5f) * 2));
+      colon = rgb565(blend(ACCENT, BLACK, ta * ca));
+    }
+    if (drawText && ta > .02f) drawText(fb, buf, 120, (int)ty, (int)tpx, col, colon);
+
+    // Pill: 24 px tall, width from text length, centred at y 280.
+    if (p.pillAlpha > .02f) {
+      float pw = strlen(pillText) * 8 + 26;
+      roundRect(fb, 120 - pw / 2, 268, pw, 24, 12, PILL_BG, p.pillAlpha);
+      if (drawText) drawText(fb, pillText, 120, 280, 13, rgb565(blend(ACCENT, BLACK, p.pillAlpha)), rgb565(blend(ACCENT, BLACK, p.pillAlpha)));
+    }
+
+    float da = state == BREAK ? lerp(.6f, 1, .5f + .5f * sinf(6.2831853f * (now % 3000) / 3000.f)) : .6f;
+    circle(fb, 120, 306, 2.5f, ACCENT, da);
+  }
+
+  // ---------- SDF rasteriser ----------
+  static uint16_t rgb565(uint32_t c) { return (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x1F)); }
+  static uint32_t from565(uint16_t c) { uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31; return ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31); }
+  static uint32_t blend(uint32_t a, uint32_t b, float t) {
+    t = clamp01(t);
+    uint32_t r = (uint32_t)(((a >> 16) & 255) * t + ((b >> 16) & 255) * (1 - t));
+    uint32_t g = (uint32_t)(((a >> 8) & 255) * t + ((b >> 8) & 255) * (1 - t));
+    uint32_t bl = (uint32_t)((a & 255) * t + (b & 255) * (1 - t));
+    return (r << 16) | (g << 8) | bl;
+  }
+  static void plot(uint16_t* fb, int x, int y, uint32_t col, float cov) {
+    if (x < 0 || y < 0 || x >= W || y >= H || cov <= 0.003f) return;
+    uint16_t& px = fb[y * W + x];
+    if (cov >= .997f) { px = rgb565(col); return; }
+    px = rgb565(blend(col, from565(px), cov));
+  }
+  static float cov(float d) { return clamp01(.5f - d); }
+  static float sdRR(float px, float py, float x, float y, float w, float h, float r) {
+    float qx = fabsf(px - (x + w / 2)) - (w / 2 - r), qy = fabsf(py - (y + h / 2)) - (h / 2 - r);
+    float ax = fmaxf(qx, 0), ay = fmaxf(qy, 0);
+    return sqrtf(ax * ax + ay * ay) + fminf(fmaxf(qx, qy), 0) - r;
+  }
+  void roundRect(uint16_t* fb, float x, float y, float w, float h, float r, uint32_t col, float a) {
+    for (int py = (int)floorf(y) - 1; py <= (int)ceilf(y + h) + 1; py++)
+      for (int px = (int)floorf(x) - 1; px <= (int)ceilf(x + w) + 1; px++)
+        plot(fb, px, py, col, a * cov(sdRR(px + .5f, py + .5f, x, y, w, h, r)));
+  }
+  void circle(uint16_t* fb, float cx, float cy, float r, uint32_t col, float a) {
+    for (int py = (int)floorf(cy - r) - 1; py <= (int)ceilf(cy + r) + 1; py++)
+      for (int px = (int)floorf(cx - r) - 1; px <= (int)ceilf(cx + r) + 1; px++) {
+        float dx = px + .5f - cx, dy = py + .5f - cy;
+        plot(fb, px, py, col, a * cov(sqrtf(dx * dx + dy * dy) - r));
+      }
+  }
+  void circleClip(uint16_t* fb, float cx, float cy, float r, uint32_t col, float a, float mx, float my, float mw, float mh, float mr) {
+    for (int py = (int)floorf(cy - r) - 1; py <= (int)ceilf(cy + r) + 1; py++)
+      for (int px = (int)floorf(cx - r) - 1; px <= (int)ceilf(cx + r) + 1; px++) {
+        float dx = px + .5f - cx, dy = py + .5f - cy;
+        float d = fmaxf(sqrtf(dx * dx + dy * dy) - r, sdRR(px + .5f, py + .5f, mx, my, mw, mh, mr));
+        plot(fb, px, py, col, a * cov(d));
+      }
+  }
+  void capsule(uint16_t* fb, float ax, float ay, float bx, float by, float r, uint32_t col, float a) {
+    float vx = bx - ax, vy = by - ay, len2 = vx * vx + vy * vy;
+    for (int py = (int)(fminf(ay, by) - r - 1); py <= (int)(fmaxf(ay, by) + r + 1); py++)
+      for (int px = (int)(fminf(ax, bx) - r - 1); px <= (int)(fmaxf(ax, bx) + r + 1); px++) {
+        float qx = px + .5f - ax, qy = py + .5f - ay;
+        float t = len2 > 0 ? clamp01((qx * vx + qy * vy) / len2) : 0;
+        float dx = qx - t * vx, dy = qy - t * vy;
+        plot(fb, px, py, col, a * cov(sqrtf(dx * dx + dy * dy) - r));
+      }
+  }
+  void quadStroke(uint16_t* fb, float x0, float y0, float cx, float cy, float x1, float y1, float w, uint32_t col, float a) {
+    const int N = 10; float ax = x0, ay = y0;
+    for (int i = 1; i <= N; i++) {
+      float t = (float)i / N, u = 1 - t;
+      float bx = u * u * x0 + 2 * u * t * cx + t * t * x1, by = u * u * y0 + 2 * u * t * cy + t * t * y1;
+      capsule(fb, ax, ay, bx, by, w / 2, col, a);
+      ax = bx; ay = by;
+    }
+  }
+};
