@@ -1,0 +1,696 @@
+// JUNI — full focus-companion firmware
+// Arduino IDE version adapted to the CURRENT working juni_well_done hardware setup.
+//
+// Hardware kept exactly on the current JUNI pins:
+//   TFT: CS 10, RST 9, DC 4, MOSI 11, SCLK 12 (MISO 13 optional)
+//   Encoder: S1 6, S2 7, KEY 8
+//
+// Display stack kept from the current working sketch:
+//   Adafruit_GFX + Adafruit_ST7789
+//
+// Visual layer:
+//   juni_ui.h = all 7 product states + expressions + transitions
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <string.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+
+#include "juni_idle.h"
+
+
+// ============================================================
+// IMPORTANT ARDUINO IDE TYPE DECLARATIONS
+// ============================================================
+//
+// Arduino auto-generates function prototypes near the top of a .ino file.
+// Any custom return/argument type used by those functions must already be
+// declared before Arduino inserts those prototypes.
+//
+// Keeping these here fixes:
+//   'PressType' does not name a type
+//   'AppState' was not declared in this scope
+//
+enum PressType : uint8_t {
+  PRESS_NONE,
+  PRESS_SHORT,
+  PRESS_LONG
+};
+
+using AppState = JuniUI::State;
+
+
+// ============================================================
+// 1. CURRENT JUNI HARDWARE
+// ============================================================
+
+// ---------- TFT ----------
+#define TFT_CS     10
+#define TFT_RST     9
+#define TFT_DC      4
+#define TFT_MOSI   11
+#define TFT_SCLK   12
+#define TFT_MISO   13     // optional / currently not required
+
+// ---------- Rotary encoder ----------
+#define ENC_S1      6
+#define ENC_S2      7
+#define ENC_KEY     8
+
+// Change to 1 only if clockwise decreases the time.
+#define ENC_INVERT  0
+
+// Most KY-040-style encoders generate 4 quadrature steps per click.
+// If one physical click does not equal one 5-minute change, try 2.
+#define ENC_STEPS_PER_DETENT 4
+
+#define TFT_SPI_HZ 40000000
+
+
+// ============================================================
+// 2. PRODUCT RULES
+// ============================================================
+
+static constexpr int MIN_MINUTES     = 5;
+static constexpr int MAX_MINUTES     = 120;
+static constexpr int STEP_MINUTES    = 5;
+static constexpr int DEFAULT_MINUTES = 25;
+
+static constexpr uint32_t LONG_PRESS_MS      = 1500;
+static constexpr uint32_t BUTTON_DEBOUNCE_MS = 25;
+static constexpr uint32_t SELECT_TIMEOUT_MS  = 5000;
+static constexpr uint32_t STARTING_MS        = 700;
+static constexpr uint32_t CANCELING_MS       = 1200;
+static constexpr uint32_t FRAME_MS           = 33;   // about 30 FPS
+
+
+// ============================================================
+// 3. DISPLAY + FRAMEBUFFER
+// ============================================================
+
+Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
+
+uint16_t *frameBuffer = nullptr;
+
+
+// Adafruit_GFX normally draws directly to a display.
+// This tiny wrapper makes it draw text into JUNI's RGB565 framebuffer.
+class FrameBufferGFX : public Adafruit_GFX {
+public:
+  uint16_t *buffer = nullptr;
+
+  FrameBufferGFX() : Adafruit_GFX(JuniUI::W, JuniUI::H) {}
+
+  void setBuffer(uint16_t *b) {
+    buffer = b;
+  }
+
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+    if (!buffer) return;
+    if (x < 0 || y < 0 || x >= JuniUI::W || y >= JuniUI::H) return;
+    buffer[y * JuniUI::W + x] = color;
+  }
+};
+
+FrameBufferGFX textRenderer;
+JuniUI ui;
+
+
+// ============================================================
+// 4. TEXT RENDERING FOR juni_ui.h
+// ============================================================
+
+static const GFXfont *fontForPixelHeight(int px) {
+  if (px >= 48) return &FreeSansBold24pt7b;
+  if (px >= 32) return &FreeSansBold18pt7b;
+  if (px >= 18) return &FreeSansBold12pt7b;
+  return &FreeSansBold9pt7b;
+}
+
+static int textWidthFor(const char *text, const GFXfont *font) {
+  textRenderer.setFont(font);
+  textRenderer.setTextSize(1);
+  int16_t x1, y1;
+  uint16_t w, h;
+  textRenderer.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  return (int)w;
+}
+
+static void drawCenteredText(
+  const char *text,
+  int cx,
+  int cy,
+  uint16_t color,
+  const GFXfont *font
+) {
+  textRenderer.setFont(font);
+  textRenderer.setTextSize(1);
+  textRenderer.setTextColor(color);
+  textRenderer.setTextWrap(false);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  textRenderer.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+
+  int cursorX = cx - ((int)w / 2) - x1;
+  int cursorY = cy - ((int)h / 2) - y1;
+
+  textRenderer.setCursor(cursorX, cursorY);
+  textRenderer.print(text);
+}
+
+
+// juni_ui.h asks for one generic text callback.
+// It can optionally pulse the ":" separately during focus.
+static void drawTextHook(
+  uint16_t *fb,
+  const char *text,
+  int cx,
+  int cy,
+  int px,
+  uint16_t color,
+  uint16_t colonColor
+) {
+  textRenderer.setBuffer(fb);
+
+  const GFXfont *font = fontForPixelHeight(px);
+  const char *colon = strchr(text, ':');
+
+  // Normal text, or no special colon color needed.
+  if (!colon || color == colonColor) {
+    drawCenteredText(text, cx, cy, color, font);
+    return;
+  }
+
+  // Timer with independently colored/pulsing colon.
+  char left[12] = {0};
+  size_t leftLen = (size_t)(colon - text);
+  if (leftLen >= sizeof(left)) leftLen = sizeof(left) - 1;
+  memcpy(left, text, leftLen);
+  left[leftLen] = '\0';
+
+  const char *right = colon + 1;
+
+  int wl = textWidthFor(left, font);
+  int wc = textWidthFor(":", font);
+  int wr = textWidthFor(right, font);
+  int total = wl + wc + wr;
+  int x = cx - total / 2;
+
+  if (wl > 0) {
+    drawCenteredText(left, x + wl / 2, cy, color, font);
+    x += wl;
+  }
+
+  drawCenteredText(":", x + wc / 2, cy, colonColor, font);
+  x += wc;
+
+  if (wr > 0) {
+    drawCenteredText(right, x + wr / 2, cy, color, font);
+  }
+}
+
+
+// Push the completed 240x320 framebuffer to the physical TFT.
+static void pushFrame() {
+  tft.startWrite();
+  tft.setAddrWindow(0, 0, JuniUI::W, JuniUI::H);
+  tft.writePixels(frameBuffer, (uint32_t)JuniUI::W * JuniUI::H, true);
+  tft.endWrite();
+}
+
+
+// ============================================================
+// 5. ROTARY ENCODER
+// ============================================================
+
+// Interrupt decoding is used because a full 240x320 frame takes time to send.
+// This prevents dial clicks from being missed while the display is updating.
+static volatile int32_t encSteps = 0;
+static volatile uint8_t encHistory = 0;
+
+static const int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+void IRAM_ATTR encoderISR() {
+  uint8_t current =
+    (digitalRead(ENC_S1) << 1) |
+     digitalRead(ENC_S2);
+
+  encHistory =
+    ((encHistory << 2) | current) & 0x0F;
+
+  encSteps += ENC_TABLE[encHistory];
+}
+
+static int32_t encoderAccum = 0;
+
+static int takeEncoderDetents() {
+  noInterrupts();
+  int32_t steps = encSteps;
+  encSteps = 0;
+  interrupts();
+
+  encoderAccum += steps;
+
+  int detents =
+    encoderAccum / ENC_STEPS_PER_DETENT;
+
+  encoderAccum -=
+    detents * ENC_STEPS_PER_DETENT;
+
+#if ENC_INVERT
+  detents = -detents;
+#endif
+
+  return detents;
+}
+
+
+// ============================================================
+// 6. ROTARY BUTTON — SHORT + LONG PRESS
+// ============================================================
+
+static bool buttonRawLast = false;
+static bool buttonStable = false;
+static bool longPressFired = false;
+
+static uint32_t buttonRawChangedAt = 0;
+static uint32_t buttonDownAt = 0;
+
+static PressType readButton(uint32_t now) {
+  bool rawPressed =
+    (digitalRead(ENC_KEY) == LOW);
+
+  if (rawPressed != buttonRawLast) {
+    buttonRawLast = rawPressed;
+    buttonRawChangedAt = now;
+  }
+
+  if (
+    rawPressed != buttonStable &&
+    now - buttonRawChangedAt >= BUTTON_DEBOUNCE_MS
+  ) {
+    buttonStable = rawPressed;
+
+    if (buttonStable) {
+      buttonDownAt = now;
+      longPressFired = false;
+    } else {
+      if (!longPressFired) {
+        return PRESS_SHORT;
+      }
+    }
+  }
+
+  if (
+    buttonStable &&
+    !longPressFired &&
+    now - buttonDownAt >= LONG_PRESS_MS
+  ) {
+    longPressFired = true;
+    return PRESS_LONG;
+  }
+
+  return PRESS_NONE;
+}
+
+
+// ============================================================
+// 7. PRODUCT STATE MACHINE
+// ============================================================
+
+static AppState state = AppState::IDLE;
+
+static uint32_t stateEnteredAt = 0;
+static uint32_t lastInputAt = 0;
+static uint32_t timerTickAt = 0;
+
+static int selectedMinutes = DEFAULT_MINUTES;
+static int32_t remainingMs = 0;
+
+
+static const char *stateName(AppState s) {
+  switch (s) {
+    case AppState::IDLE:        return "IDLE";
+    case AppState::TIME_SELECT: return "TIME_SELECT";
+    case AppState::STARTING:    return "STARTING";
+    case AppState::FOCUS:       return "FOCUS";
+    case AppState::BREAK:       return "BREAK";
+    case AppState::CANCELING:   return "CANCELING";
+    case AppState::FINISHED:    return "FINISHED";
+  }
+  return "?";
+}
+
+
+static void goToState(
+  AppState next,
+  uint32_t now
+) {
+  Serial.print("[JUNI] ");
+  Serial.print(stateName(state));
+  Serial.print(" -> ");
+  Serial.println(stateName(next));
+
+  state = next;
+  stateEnteredAt = now;
+  ui.enter(next, now);
+}
+
+
+static void adjustMinutes(
+  int detents,
+  uint32_t now
+) {
+  if (detents == 0) return;
+
+  int newMinutes =
+    selectedMinutes +
+    detents * STEP_MINUTES;
+
+  selectedMinutes =
+    constrain(
+      newMinutes,
+      MIN_MINUTES,
+      MAX_MINUTES
+    );
+
+  // UI's little number-change animation.
+  ui.bump(
+    now,
+    detents > 0 ? +1 : -1
+  );
+
+  lastInputAt = now;
+
+  Serial.print("[JUNI] selected ");
+  Serial.print(selectedMinutes);
+  Serial.println(" min");
+}
+
+
+static void updateProduct(uint32_t now) {
+  int detents = takeEncoderDetents();
+  PressType press = readButton(now);
+
+  if (detents != 0 || press != PRESS_NONE) {
+    lastInputAt = now;
+  }
+
+  switch (state) {
+
+    // --------------------------------------------------------
+    // IDLE
+    // --------------------------------------------------------
+    case AppState::IDLE:
+      if (detents != 0) {
+        goToState(AppState::TIME_SELECT, now);
+        adjustMinutes(detents, now);
+      }
+      else if (press == PRESS_SHORT) {
+        remainingMs =
+          (int32_t)selectedMinutes * 60000L;
+
+        goToState(AppState::STARTING, now);
+      }
+      break;
+
+
+    // --------------------------------------------------------
+    // TIME SELECT
+    // --------------------------------------------------------
+    case AppState::TIME_SELECT:
+      if (detents != 0) {
+        adjustMinutes(detents, now);
+      }
+      else if (press == PRESS_SHORT) {
+        remainingMs =
+          (int32_t)selectedMinutes * 60000L;
+
+        goToState(AppState::STARTING, now);
+      }
+      else if (
+        now - lastInputAt >= SELECT_TIMEOUT_MS
+      ) {
+        goToState(AppState::IDLE, now);
+      }
+      break;
+
+
+    // --------------------------------------------------------
+    // STARTING
+    // --------------------------------------------------------
+    case AppState::STARTING:
+      if (
+        now - stateEnteredAt >= STARTING_MS
+      ) {
+        timerTickAt = now;
+        goToState(AppState::FOCUS, now);
+      }
+      break;
+
+
+    // --------------------------------------------------------
+    // FOCUS
+    // --------------------------------------------------------
+    case AppState::FOCUS: {
+      uint32_t elapsed =
+        now - timerTickAt;
+
+      timerTickAt = now;
+
+      remainingMs -=
+        (int32_t)elapsed;
+
+      if (remainingMs <= 0) {
+        remainingMs = 0;
+        goToState(AppState::FINISHED, now);
+      }
+      else if (press == PRESS_LONG) {
+        goToState(AppState::CANCELING, now);
+      }
+      else if (press == PRESS_SHORT) {
+        goToState(AppState::BREAK, now);
+      }
+
+      break;
+    }
+
+
+    // --------------------------------------------------------
+    // BREAK / PAUSED
+    // --------------------------------------------------------
+    case AppState::BREAK:
+      // Timer intentionally does NOT change here.
+      if (press == PRESS_LONG) {
+        goToState(AppState::CANCELING, now);
+      }
+      else if (press == PRESS_SHORT) {
+        timerTickAt = now;
+        goToState(AppState::FOCUS, now);
+      }
+      break;
+
+
+    // --------------------------------------------------------
+    // CANCELING
+    // --------------------------------------------------------
+    case AppState::CANCELING:
+      if (
+        now - stateEnteredAt >= CANCELING_MS
+      ) {
+        remainingMs = 0;
+        goToState(AppState::IDLE, now);
+      }
+      break;
+
+
+    // --------------------------------------------------------
+    // FINISHED
+    // --------------------------------------------------------
+    case AppState::FINISHED:
+      if (
+        press == PRESS_SHORT ||
+        press == PRESS_LONG
+      ) {
+        remainingMs = 0;
+        goToState(AppState::IDLE, now);
+      }
+      break;
+  }
+}
+
+
+// ============================================================
+// 8. SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // ---------- display: same setup as current juni_well_done ----------
+  SPI.begin(
+    TFT_SCLK,
+    -1,
+    TFT_MOSI,
+    TFT_CS
+  );
+
+  tft.init(240, 320);
+  tft.setRotation(0);
+  tft.setSPISpeed(TFT_SPI_HZ);
+
+  // IMPORTANT:
+  // Current JUNI files were corrected to NORMAL colors.
+  tft.invertDisplay(false);
+
+  tft.fillScreen(ST77XX_BLACK);
+
+
+  // ---------- encoder ----------
+  pinMode(ENC_S1, INPUT_PULLUP);
+  pinMode(ENC_S2, INPUT_PULLUP);
+  pinMode(ENC_KEY, INPUT_PULLUP);
+
+  encHistory =
+    (digitalRead(ENC_S1) << 1) |
+     digitalRead(ENC_S2);
+
+  attachInterrupt(
+    digitalPinToInterrupt(ENC_S1),
+    encoderISR,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(ENC_S2),
+    encoderISR,
+    CHANGE
+  );
+
+  // Initialize the debounced button state so booting while untouched
+  // does not create a fake first press.
+  buttonRawLast =
+    (digitalRead(ENC_KEY) == LOW);
+
+  buttonStable =
+    buttonRawLast;
+
+
+  // ---------- full-screen RGB565 framebuffer ----------
+  const size_t framebufferBytes =
+    (size_t)JuniUI::W *
+    JuniUI::H *
+    sizeof(uint16_t);
+
+  frameBuffer =
+    (uint16_t *)ps_malloc(
+      framebufferBytes
+    );
+
+  // Fallback for boards where PSRAM is unavailable.
+  if (!frameBuffer) {
+    frameBuffer =
+      (uint16_t *)malloc(
+        framebufferBytes
+      );
+  }
+
+  if (!frameBuffer) {
+    Serial.println(
+      "[JUNI] ERROR: framebuffer allocation failed"
+    );
+
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 30);
+    tft.print("Framebuffer");
+    tft.setCursor(10, 55);
+    tft.print("allocation failed");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  memset(
+    frameBuffer,
+    0,
+    framebufferBytes
+  );
+
+  textRenderer.setBuffer(frameBuffer);
+
+  // Connect generic text drawing to the full JUNI UI.
+  ui.drawText = drawTextHook;
+
+  uint32_t now = millis();
+
+  lastInputAt = now;
+  stateEnteredAt = now;
+
+  ui.enter(AppState::IDLE, now);
+
+  // First frame immediately.
+  ui.render(
+    frameBuffer,
+    now,
+    selectedMinutes,
+    0
+  );
+
+  pushFrame();
+
+  Serial.println("[JUNI] full firmware ready");
+}
+
+
+// ============================================================
+// 9. LOOP
+// ============================================================
+
+void loop() {
+  uint32_t now = millis();
+
+  // Input + product logic is always serviced first.
+  updateProduct(now);
+
+  static uint32_t lastFrameAt = 0;
+
+  if (
+    now - lastFrameAt >= FRAME_MS
+  ) {
+    lastFrameAt = now;
+
+    // Ceil milliseconds to seconds:
+    // 24:59.2 remains displayed as 25:00 until a full second passes.
+    int remainingSeconds = 0;
+
+    if (remainingMs > 0) {
+      remainingSeconds =
+        (remainingMs + 999) / 1000;
+    }
+
+    ui.render(
+      frameBuffer,
+      now,
+      selectedMinutes,
+      remainingSeconds
+    );
+
+    pushFrame();
+  }
+}
