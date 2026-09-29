@@ -1,0 +1,1056 @@
+// juni_idle.h — JUNI visual layer. Same class, same API as before:
+//
+//   JuniUI ui;
+//   ui.drawText = drawTextHook;          // unchanged
+//   ui.enter(JuniUI::IDLE, millis());    // on every state change
+//   ui.bump(millis(), +1 or -1);         // on every encoder detent
+//   ui.render(fb, millis(), selectedMinutes, remainingSeconds);   // ~30 fps
+//
+// Nothing in the .ino needs to change.
+//
+// Character: white dome head, earless, two black patches tilted so the
+// outer end sits lower, a real eye inside each patch (white sclera + black
+// pupil + catch-light) so the panda can actually look around, small nose,
+// omega mouth. Every pixel is white, black or a grey blend of the two.
+//
+//   IDLE      self-performs: looks around, double-blinks, winks,
+//             squint-smiles — one beat every 1-3 s
+//   TIME_SELECT  big minutes + MIN inside a thin open dial with a knob dot on
+//             the arc, small relaxed JUNI below it, "Press to start"
+//   STARTING  patches 8% larger, eyes up and brighter, open smile, head lifts
+//   FOCUS     lid cut down over each patch, eyes low, flat mouth
+//   BREAK     patches become closed arcs, soft mouth, slow breath, zZ drifts
+//   CANCELING patches tilt the other way like knitted brows, frown, anger mark
+//   FINISHED  patches become happy arcs, wide smile, sparkles, a wink at 700 ms
+//
+// Draws into a 240x320 RGB565 framebuffer, anti-aliased via signed-distance
+// coverage. Authored for NORMAL (non-inverted) colour.
+
+#pragma once
+#include <stdint.h>
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+class JuniUI {
+public:
+  enum State { IDLE, TIME_SELECT, STARTING, FOCUS, BREAK, CANCELING, FINISHED };
+  static constexpr int W = 240, H = 320;
+
+  // ---------- palette: white on black, nothing else ----------
+  static constexpr uint32_t WHITE   = 0xFFFFFF;
+  static constexpr uint32_t BLACK   = 0x000000;
+  static constexpr uint32_t FUR     = 0xFFFFFF;   // head, white of the eye
+  static constexpr uint32_t INK     = 0x000000;   // patches, pupil, nose, mouth
+  static constexpr uint32_t PILL_BG = 0x262626;   // status pill background
+
+  // ---------- SET TIMER screen palette: warm, near-black, no blue ----------
+  // These are 0xRRGGBB, like the rest of the palette: every primitive here
+  // blends in 24-bit and rgb565() converts once, at the pixel. Editing the hex
+  // is all you need — there is no separate RGB565 value to keep in sync.
+  static constexpr uint32_t UI_BG             = 0x050506;   // near black
+  static constexpr uint32_t UI_TEXT_MAIN      = 0xF7F3EE;   // the big number: warm off-white
+  static constexpr uint32_t UI_TEXT_SECONDARY = 0xBDB6AE;   // MIN, "Press to start"
+  static constexpr uint32_t JUNI_PEACH        = 0xFFB47A;   // the body of the glow
+  static constexpr uint32_t JUNI_PEACH_LIGHT  = 0xFFD2A6;   // its brightest edge
+  static constexpr uint32_t JUNI_PEACH_DARK   = 0x8D5435;   // where it fades into the background
+
+  void (*drawText)(uint16_t* fb, const char* s, int cx, int cy, int px, uint16_t col, uint16_t colonCol) = nullptr;
+
+  // Optional. Draws a string larger than the bundled fonts allow, scaled to the
+  // given cap height but never wider than maxW, anti-aliased. Only the SET
+  // TIMER number uses it; if it is left null that number falls back to drawText
+  // at the largest bundled size, and every other screen is unaffected.
+  void (*drawBigNumber)(uint16_t* fb, const char* s, int cx, int cy, int capPx, int maxW, uint16_t col) = nullptr;
+
+  // ---------- pose: everything the renderer needs, all interpolable ----------
+  struct Pose {
+    float faceY = 118, faceScale = 1, faceAlpha = 1, faceDy = 0, faceDx = 0;
+    float headRot = 0;                  // degrees; positive = head leans right
+    float patchS  = 1;                  // patch scale
+    float tilt    = 14;                 // degrees; positive = outer end lower, negative = brows
+    float lid     = 0;                  // 0 open ... 1 closed (black lid cut down from the top)
+    float blinkL  = 0, blinkR = 0;      // per-eye closure, driven by the idle director
+    float gazeX   = 0, gazeY = 0;       // pupil offset, face-local px
+    float gazeIn  = 0;                  // pupils toward the nose, mirrored per eye
+    float eyeY    = 0, eyeS  = 1;       // eye vertical bias / size
+    float arcHappy = 0;                 // 1 swaps the open patch for a closed happy curve
+    float mw = 9, mdip = 5, omega = 1;  // mouth: half width, curvature, centre-join lift
+    float timerPx = 56, timerY = 234, timerAlpha = 1, pillAlpha = 1;
+    float capAlpha = 0;                 // idle caption under the timer
+    float sparkle = 0;
+  };
+
+  void enter(State s, uint32_t now) {
+    prevState = state; state = s; tState = now;
+    from = cur;                                   // transition starts from what is on screen
+    dur  = transitionMs(prevState, s);
+    nextBlink = now + rnd(4000, 7000); blinkStart = 0;
+    nextGaze  = now;
+    act = ACT_NONE; nextActAt = now + rnd(700, 1400);
+  }
+  void bump(uint32_t now, int dir) { bumpStart = now; bumpDir = dir; }
+
+  void render(uint16_t* fb, uint32_t now, int selectedMinutes, int remainingSeconds) {
+    uint32_t t = now - tState;
+    Pose tgt = target(state, t);
+    float k = dur ? easeOut((float)t / dur) : 1;
+    cur = lerpPose(from, tgt, k);
+    behaviour(now, t);
+    if (state == IDLE) idlePerform(now, t);       // additive, on top of the settled pose
+
+    memset(fb, 0, (size_t)W * H * 2);
+    drawFace(fb, now);
+    drawInfo(fb, now, t, selectedMinutes, remainingSeconds);
+  }
+
+private:
+  // ---------- idle micro-performance ----------
+  enum Act : uint8_t { ACT_NONE, ACT_BLINK2, ACT_LOOK, ACT_WINK, ACT_SQUINT, ACT_COUNT };
+
+  State state = IDLE, prevState = IDLE;
+  uint32_t tState = 0, dur = 0, nextBlink = 0, blinkStart = 0, gazeStart = 0, nextGaze = 0, bumpStart = 0;
+  int bumpDir = 0;
+  uint8_t act = ACT_NONE, lastAct = ACT_NONE;
+  uint32_t actStart = 0, actEnd = 0, nextActAt = 0;
+  int actSide = -1;
+  Pose from, cur;
+  float blink = 0, breath = 0, gX = 0, gY = 0, gFromX = 0, gFromY = 0, gToX = 0, gToY = 0;
+  uint32_t seed = 0x9E3779B9u;
+
+  // ---------- face geometry, in face-local units (origin = head centre) ----------
+  static constexpr float HEAD_RX = 106, HEAD_RY = 75, HEAD_CY = -3;   // upper dome
+  static constexpr float JAW_RX  = 96,  JAW_RY  = 48, JAW_CY  = 22;   // fuller lower cheeks
+  static constexpr float EYE_DX  = 56,  EYE_CY  = 9;                  // patch centres
+  static constexpr float EYE_RX  = 28,  EYE_RY  = 23;                 // patch radii
+  static constexpr float SCL_RX  = 11.5f, SCL_RY = 12.5f;             // white of the eye
+  static constexpr float PUP_R   = 6.4f;                              // pupil
+  static constexpr float NOSE_Y  = 21,  MOUTH_Y = 31;
+  static constexpr float DEG     = 0.01745329f;
+
+  // ---------- SET TIMER screen layout, in screen pixels ----------
+  // The whole composition lives here, so it can be retuned without reading any
+  // drawing code. Vertical rhythm: breathing room, the organic shape holding the
+  // time, a gap, JUNI, a wider gap, one quiet line, breathing room.
+
+  // The soft organic shape. WIDTH/HEIGHT are the full size of the shape itself;
+  // the glow reaches GLOW_OUT beyond that edge and GLOW_IN back inside it, so
+  // the lit area is about (WIDTH + 2*GLOW_OUT) across.
+  static constexpr float ORGANIC_CENTER_X = 120;
+  static constexpr float ORGANIC_CENTER_Y = 118;
+  static constexpr float ORGANIC_WIDTH    = 168;
+  static constexpr float ORGANIC_HEIGHT   = 152;
+  static constexpr float ORGANIC_GLOW_OUT = 19;    // outward reach of the faint bloom
+  static constexpr float ORGANIC_GLOW_IN  = 26;    // inward fade, wide so the centre goes black
+  static constexpr float ORGANIC_BUMP     = .020f; // detent breath, as a fraction of the size
+
+  static constexpr int   SET_TIME_CENTER_X  = 120;
+  static constexpr int   SET_TIME_CENTER_Y  = 102;
+  // Cap height in px, and the width it must never exceed. 58 is well past the
+  // 34 px the bundled font gives, so this is the scaled-and-anti-aliased path.
+  // The width limit is what makes "120" render a little smaller than "45"
+  // rather than running into the shape around it.
+  static constexpr int   SET_TIME_FONT_SIZE = 58;
+  static constexpr int   SET_TIME_MAX_W     = 112;
+  static constexpr int   SET_MIN_Y          = 156;
+  static constexpr int   SET_MIN_FONT_SIZE  = 13;
+
+  static constexpr float JUNI_SET_X    = 120;      // the mascot is drawFace(), just posed small
+  static constexpr float JUNI_SET_Y    = 250;
+  static constexpr float JUNI_SET_SIZE = .31f;     // 1.0 is the idle-screen size
+
+  static constexpr float SPARK_DX = 64;            // the two accent marks, either side of JUNI
+  static constexpr float SPARK_Y  = 250;
+  static constexpr float SPARK_R  = 9;
+
+  static constexpr int   START_TEXT_Y    = 296;
+  static constexpr int   START_TEXT_SIZE = 13;
+
+  // Face-local -> screen transform (scale + head tilt + offset).
+  struct FaceXf {
+    float cx = 120, cy = 118, s = 1, invS = 1, c = 1, sn = 0;
+    void map(float lx, float ly, float& X, float& Y) const {
+      X = cx + (lx * c - ly * sn) * s;
+      Y = cy + (lx * sn + ly * c) * s;
+    }
+    void unmap(float X, float Y, float& lx, float& ly) const {
+      float dx = (X - cx) * invS, dy = (Y - cy) * invS;
+      lx =  dx * c + dy * sn;
+      ly = -dx * sn + dy * c;
+    }
+  };
+
+  uint32_t rnd(uint32_t lo, uint32_t hi) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return lo + seed % (hi - lo + 1); }
+  static float clamp01(float t) { return t < 0 ? 0 : t > 1 ? 1 : t; }
+  static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+  static float easeOut(float t) { t = clamp01(t); return 1 - (1 - t) * (1 - t) * (1 - t); }
+  static float easeIn(float t) { t = clamp01(t); return t * t * t; }
+  static float easeInOut(float t) { t = clamp01(t); return t < .5f ? 4 * t * t * t : 1 - powf(-2 * t + 2, 3) / 2; }
+  static float lerp(float a, float b, float t) { return a + (b - a) * t; }
+  static float seg(uint32_t t, uint32_t a, uint32_t b) { return t <= a ? 0 : t >= b ? 1 : (float)(t - a) / (b - a); }
+  // One close-and-open pulse across [a,b): fast shut, slower open.
+  static float pulse(uint32_t t, uint32_t a, uint32_t b) {
+    if (t <= a || t >= b) return 0;
+    float u = (float)(t - a) / (b - a);
+    return u < .38f ? easeOut(u / .38f) : 1 - easeInOut((u - .38f) / .62f);
+  }
+
+  static uint32_t transitionMs(State a, State b) {
+    switch (b) {
+      case TIME_SELECT: return 260;
+      case STARTING:    return 280;
+      case FOCUS:       return a == BREAK ? 350 : a == STARTING ? 170 : 240;
+      case BREAK:       return 260;
+      case CANCELING:   return 220;
+      case FINISHED:    return 0;      // keyframed inside target()
+      default:          return 300;    // IDLE
+    }
+  }
+
+  // ---------- expressions ----------
+  // JUNI is drawn exactly once, by drawFace(), from a single Pose. An
+  // expression is nothing more than a handful of numbers in the table below,
+  // so every state is the same character with the same head, the same
+  // silhouette and the same eye patches.
+  //
+  // Note what is deliberately NOT in here: tilt and patchS. The eye patches
+  // therefore keep their shape, size and angle in every state, and no
+  // expression can turn them into eyebrows.
+  //
+  // Only the pupils, the eyelid, the eye shape and the mouth vary.
+  enum Expr : uint8_t {
+    JUNI_NORMAL,      // the base face; every other expression is a nudge from it
+    JUNI_LOOK_UP,     // set timer: glancing up at the number being chosen
+    JUNI_FOCUS,       // focusing: calm concentration, eyes open
+    JUNI_BREAK,       // break: eyes gently closed, resting, not asleep
+    JUNI_PAUSED,      // reserved: BREAK currently doubles as pause, see target()
+    JUNI_CANCELLED,   // cancelled: neutral, "okay, stopped"
+    JUNI_HAPPY,       // finished: both eyes soft happy curves
+    EXPR_COUNT
+  };
+
+  struct Expression {
+    float gazeX;      // pupils left/right, face-local px
+    float gazeY;      // pupils up (negative) / down (positive)
+    float gazeIn;     // pupils toward the nose, mirrored per eye
+    float lid;        // upper eyelid, 0 open .. 1 closed. Keep near 0: a cut
+                      // lid over a tilted patch is what reads as a scowl.
+    float eyeY;       // small vertical bias on the whole eye
+    float eyeS;       // eye scale. Leave at 1 unless you want big cartoon eyes.
+    float arcHappy;   // 1 replaces the open patch with a closed upward curve
+    float mw;         // mouth half width
+    float mdip;       // mouth curvature; 0 is straight, higher is a smile
+    float omega;      // lift of the mouth's centre join
+  };
+
+  //                      gazeX  gazeY  gazeIn  lid  eyeY  eyeS  arc    mw   mdip  omega
+  static constexpr Expression EXPR[EXPR_COUNT] = {
+    /* NORMAL    */ {      0,    0,     0,      0,   0,    1,    0,     9,    5,    1    },
+    /* LOOK_UP   */ {      0,   -3.0f,  0,      0,  -0.8f, 1,    0,    12,    8,    1    },
+    /* FOCUS     */ {      0,    1.4f,  1.3f,   0,   0.6f, 1,    0,     7.5f, 2.4f, 0.45f},
+    /* BREAK     */ {      0,    0,     0,      0,   0,    1,    1,     8.5f, 4.5f, 0.70f},
+    /* PAUSED    */ {      0,    0,     0,      0,   0,    1,    0,     8,    2,    0.30f},
+    /* CANCELLED */ {      0,    1.8f,  0,      0,   0.8f, 1,    0,     8,    0.6f, 0    },
+    /* HAPPY     */ {      0,    0,     0,      0,   0,    1,    1,    12.5f, 9,    1    },
+  };
+
+  static void applyExpr(Pose& p, uint8_t e) {
+    const Expression& x = EXPR[e];
+    p.gazeX = x.gazeX; p.gazeY = x.gazeY; p.gazeIn = x.gazeIn;
+    p.lid = x.lid; p.eyeY = x.eyeY; p.eyeS = x.eyeS;
+    p.arcHappy = x.arcHappy;
+    p.mw = x.mw; p.mdip = x.mdip; p.omega = x.omega;
+  }
+
+  // The visual target for a state, t ms after entering it. Each case picks an
+  // expression from the EXPR table, then sets only layout/animation on top.
+  Pose target(State s, uint32_t t) {
+    Pose p;
+    switch (s) {
+      case IDLE:
+        applyExpr(p, JUNI_NORMAL);
+        p.pillAlpha = 0; p.capAlpha = 1; p.timerY = 232; break;
+
+      case TIME_SELECT:
+        // Small, and glancing up at the number the student is choosing.
+        // timerPx / timerY stay at their defaults: this screen sets its own
+        // type, and the defaults keep the exit transition smooth.
+        applyExpr(p, JUNI_LOOK_UP);
+        p.faceY = JUNI_SET_Y; p.faceScale = JUNI_SET_SIZE;
+        p.faceDx = JUNI_SET_X - 120;
+        p.faceDy = -1;
+        p.pillAlpha = 0; break;
+
+      case STARTING: {
+        // A short bridge into FOCUS: the base face, lifting a little, smile
+        // opening slightly. The eye patches are left alone.
+        float k = easeOut(seg(t, 120, 380));
+        applyExpr(p, JUNI_NORMAL);
+        p.mw = lerp(9, 11.5f, k); p.mdip = lerp(5, 7.5f, k);
+        p.eyeY = -1.2f * k; p.faceDy = -3 * k; break; }
+
+      case FOCUS:
+        applyExpr(p, JUNI_FOCUS); break;
+
+      case BREAK:
+        // This state is also the pause: a short press freezes the countdown
+        // here and another resumes it, so JUNI_PAUSED is unused for now.
+        applyExpr(p, JUNI_BREAK);
+        p.faceDy = 2; p.timerAlpha = .9f; break;
+
+      case CANCELING:
+        applyExpr(p, JUNI_CANCELLED);
+        p.faceDy = 1; p.timerAlpha = .8f; p.pillAlpha = .8f; break;
+
+      case FINISHED: {
+        float lift = easeOut(seg(t, 150, 450));
+        applyExpr(p, JUNI_HAPPY);
+        p.arcHappy = easeOut(seg(t, 80, 380));   // drawFace snaps this at .5
+        p.mw = lerp(9, 12.5f, lift); p.mdip = lerp(5, 9, lift);
+        p.faceDy = -5 * lift;
+        // Two small marks, and that is all the celebration.
+        p.sparkle = t < 450 ? 0 : t < 750 ? .72f * easeOut(seg(t, 450, 750))
+                                          : lerp(.72f, .58f, easeInOut(seg(t, 750, 1200)));
+        break; }
+    }
+    return p;
+  }
+
+  static Pose lerpPose(const Pose& a, const Pose& b, float k) {
+    Pose p;
+    p.faceY = lerp(a.faceY, b.faceY, k);           p.faceScale = lerp(a.faceScale, b.faceScale, k);
+    p.faceAlpha = lerp(a.faceAlpha, b.faceAlpha, k); p.faceDy = lerp(a.faceDy, b.faceDy, k);
+    p.faceDx = lerp(a.faceDx, b.faceDx, k);        p.headRot = lerp(a.headRot, b.headRot, k);
+    p.patchS = lerp(a.patchS, b.patchS, k);        p.tilt = lerp(a.tilt, b.tilt, k);
+    p.lid = lerp(a.lid, b.lid, k);
+    p.blinkL = lerp(a.blinkL, b.blinkL, k);        p.blinkR = lerp(a.blinkR, b.blinkR, k);
+    p.gazeX = lerp(a.gazeX, b.gazeX, k);           p.gazeY = lerp(a.gazeY, b.gazeY, k);
+    p.gazeIn = lerp(a.gazeIn, b.gazeIn, k);
+    p.eyeY = lerp(a.eyeY, b.eyeY, k);              p.eyeS = lerp(a.eyeS, b.eyeS, k);
+    p.arcHappy = lerp(a.arcHappy, b.arcHappy, k);
+    p.mw = lerp(a.mw, b.mw, k);                    p.mdip = lerp(a.mdip, b.mdip, k);
+    p.omega = lerp(a.omega, b.omega, k);
+    p.timerPx = lerp(a.timerPx, b.timerPx, k);     p.timerY = lerp(a.timerY, b.timerY, k);
+    p.timerAlpha = lerp(a.timerAlpha, b.timerAlpha, k); p.pillAlpha = lerp(a.pillAlpha, b.pillAlpha, k);
+    p.capAlpha = lerp(a.capAlpha, b.capAlpha, k);
+    p.sparkle = b.sparkle;
+    return p;
+  }
+
+  // ---------- ambient behaviour: blink, breath, slow gaze drift ----------
+  void behaviour(uint32_t now, uint32_t t) {
+    float amp = state == BREAK ? 3 : state == FOCUS ? 1 : (state == TIME_SELECT || state == CANCELING) ? 0 : 1.5f;
+    float per = state == BREAK ? 5000 : 4000;
+    breath = amp * sinf(6.2831853f * (now % (uint32_t)per) / per);
+
+    // While the idle director is running a beat, it owns the eyelids.
+    bool busy = (state == IDLE && act != ACT_NONE);
+    bool canBlink = (state == IDLE || state == FOCUS || state == STARTING) && t > 400 && !busy;
+    if (canBlink && blinkStart == 0 && now >= nextBlink) blinkStart = now;
+    if (blinkStart) {
+      uint32_t b = now - blinkStart;
+      if      (b < 60)  blink = easeIn(b / 60.f);
+      else if (b < 120) blink = 1;
+      else if (b < 210) blink = 1 - easeOut((b - 120) / 90.f);
+      else { blink = 0; blinkStart = 0;
+             nextBlink = now + (rnd(0, 9) == 0 ? 200 : (state == FOCUS ? rnd(8000, 14000) : rnd(5000, 9000))); }
+    } else blink = 0;
+
+    float range = state == FOCUS ? 1.2f : state == IDLE ? 1.8f : state == FINISHED ? 3 : 0;
+    if (now >= nextGaze) {
+      gFromX = gX; gFromY = gY;
+      gToX = range ? (float)((int)rnd(0, (uint32_t)(range * 2)) - range) : 0;
+      gToY = range ? (float)((int)rnd(0, (uint32_t)(range * 2)) - range) * .7f : 0;
+      gazeStart = now; nextGaze = now + (state == FOCUS ? rnd(6000, 10000) : rnd(3000, 6000));
+    }
+    float g = easeInOut((now - gazeStart) / 450.f);
+    gX = lerp(gFromX, gToX, g); gY = lerp(gFromY, gToY, g);
+  }
+
+  static uint32_t actDuration(uint8_t a) {
+    switch (a) {
+      case ACT_BLINK2: return 660;
+      case ACT_LOOK:   return 2450;
+      case ACT_WINK:   return 1050;
+      case ACT_SQUINT: return 1550;
+    }
+    return 0;
+  }
+
+  // The idle director: pick a short beat, play it, rest, pick another.
+  // Everything here is ADDED on top of the already-settled idle pose.
+  void idlePerform(uint32_t now, uint32_t tIn) {
+    if (act == ACT_NONE) {
+      if (tIn < 500 || now < nextActAt) return;   // let the entry transition land first
+      uint8_t pick = lastAct;
+      for (int guard = 0; guard < 8 && pick == lastAct; guard++)
+        pick = (uint8_t)rnd(ACT_BLINK2, ACT_COUNT - 1);
+      act = pick; lastAct = pick;
+      actStart = now; actEnd = now + actDuration(pick);
+      actSide = rnd(0, 1) ? 1 : -1;
+    }
+    if (now >= actEnd) { act = ACT_NONE; nextActAt = now + rnd(1100, 2700); return; }
+
+    uint32_t t = now - actStart;
+    Pose& p = cur;
+
+    switch (act) {
+
+      // Two quick blinks in a row — the cheapest sign of life.
+      case ACT_BLINK2: {
+        float b = fmaxf(pulse(t, 0, 210), pulse(t, 290, 520));
+        p.blinkL = fmaxf(p.blinkL, b); p.blinkR = fmaxf(p.blinkR, b);
+        break; }
+
+      // Glance one way, then the other, then back to you. The head follows a little.
+      case ACT_LOOK: {
+        const float A = 4.2f, B = 3.6f;
+        float gx;
+        if      (t <  320) gx = easeOut(t / 320.f) * A * actSide;
+        else if (t < 1120) gx = A * actSide;
+        else if (t < 1470) gx = lerp(A * actSide, -B * actSide, easeInOut((t - 1120) / 350.f));
+        else if (t < 2090) gx = -B * actSide;
+        else               gx = lerp(-B * actSide, 0, easeOut((t - 2090) / 360.f));
+        p.gazeX   += gx;
+        p.gazeY   += 0.9f * sinf(6.2831853f * t / 2450.f);
+        p.faceDx  += gx * .55f;
+        p.headRot += gx * .38f;
+        // a saccade blink as the eyes cross the middle
+        float b = pulse(t, 1140, 1320);
+        p.blinkL = fmaxf(p.blinkL, b); p.blinkR = fmaxf(p.blinkR, b);
+        break; }
+
+      // A wink, with a smile and a head tilt toward the closed eye.
+      case ACT_WINK: {
+        float w  = t < 130 ? easeOut(t / 130.f) : t < 540 ? 1 : t < 690 ? 1 - easeOut((t - 540) / 150.f) : 0;
+        float sm = t < 130 ? easeOut(t / 130.f) : t < 800 ? 1 : 1 - easeOut((t - 800) / 250.f);
+        if (actSide < 0) p.blinkL = fmaxf(p.blinkL, w);
+        else             p.blinkR = fmaxf(p.blinkR, w);
+        p.mw += 3.0f * sm; p.mdip += 2.6f * sm;
+        p.headRot += 3.6f * actSide * sm;
+        p.faceDy  -= 1.6f * sm;
+        p.gazeY   -= 0.8f * sm;
+        break; }
+
+
+      // Contented squint — smiling with the eyes.
+      case ACT_SQUINT: {
+        float k = t < 400 ? easeOut(t / 400.f) : t < 1150 ? 1 : 1 - easeOut((t - 1150) / 400.f);
+        p.blinkL = fmaxf(p.blinkL, .58f * k); p.blinkR = fmaxf(p.blinkR, .58f * k);
+        p.mw += 4.0f * k; p.mdip += 3.0f * k;
+        p.faceDy -= 2.0f * k;
+        break; }
+    }
+  }
+
+  // ---------- character ----------
+  void drawFace(uint16_t* fb, uint32_t now) {
+    const Pose& p = cur;
+    float s = p.faceScale, a = p.faceAlpha;
+    if (a < .02f || s < .01f) return;
+
+    FaceXf f;
+    f.s = s; f.invS = 1.f / s;
+    f.cx = 120 + p.faceDx * s;
+    f.cy = p.faceY + (p.faceDy + breath) * s;
+    float hr = p.headRot * DEG;
+    f.c = cosf(hr); f.sn = sinf(hr);
+
+    headShape(fb, f, a);
+
+    for (int i = 0; i < 2; i++) {
+      int side = i ? 1 : -1;
+      float ex, ey;
+      f.map(side * EYE_DX, EYE_CY, ex, ey);
+      float rx = EYE_RX * p.patchS * s, ry = EYE_RY * p.patchS * s;
+      float rot = (p.tilt * side + p.headRot) * DEG;
+
+      float close = clamp01(fmaxf(blink, side < 0 ? p.blinkL : p.blinkR));
+
+      // The closed happy curve replaces the open patch outright rather than
+      // crossfading: two black shapes at 50% would read as grey. Both eyes use
+      // the same value, so they always match — there is no wink.
+      float happy = p.arcHappy >= .5f ? 1.f : 0.f;
+      float openA = happy > 0 ? 0.f : a;
+
+      if (openA > .02f) {
+        float pry = close > .02f ? lerp(ry, 4.5f * s, close) : ry;
+        patch(fb, ex, ey, rx, pry, rot, p.lid, openA);
+
+        // The eye only shows while the lids are far enough apart to hold it.
+        float eyeA = openA * clamp01(1 - close * 2.2f);
+        if (eyeA > .02f) {
+          bool  cut  = p.lid > .001f;
+          float cutY = ey - screenRy(rx, pry, rot) * (1 - 2 * p.lid);
+          float gx = clampf(p.gazeX + gX - side * p.gazeIn, -5.5f, 5.5f) * s;
+          float gy = clampf(p.gazeY + gY + p.eyeY, -4.5f, 4.5f) * s;
+          eyeBall(fb, ex, ey, s * p.eyeS, gx, gy, eyeA, cutY, cut);
+        }
+      }
+
+      if (happy > .02f) mappedArc(fb, f, side, -22,  8, 0, -22, 22,  8, 11 * s, a * happy);
+    }
+
+    // nose + stem
+    float nx, ny, sx0, sy0, sx1, sy1;
+    f.map(0, NOSE_Y, nx, ny);
+    ellipse(fb, nx, ny, 8.5f * s, 5.5f * s, INK, a);
+    f.map(0, NOSE_Y + 3, sx0, sy0);
+    f.map(0, NOSE_Y + 8, sx1, sy1);
+    capsule(fb, sx0, sy0, sx1, sy1, 1.5f * s, INK, a);
+
+    // mouth: two quads meeting in the middle. omega lifts the join, mdip < 0 makes a frown.
+    float hw = p.mw, dip = p.mdip, mid = dip * .28f * p.omega, lw = 2.8f * s;
+    float ax, ay, bx, by, qx, qy;
+    f.map(-hw, MOUTH_Y, ax, ay);
+    f.map(-hw * .5f, MOUTH_Y + dip, qx, qy);
+    f.map(0, MOUTH_Y + mid, bx, by);
+    quadStroke(fb, ax, ay, qx, qy, bx, by, lw, INK, a);
+    f.map(hw * .5f, MOUTH_Y + dip, qx, qy);
+    f.map(hw, MOUTH_Y, ax, ay);
+    quadStroke(fb, bx, by, qx, qy, ax, ay, lw, INK, a);
+
+    // Two small four-point marks, the same shape the set-timer screen uses.
+    // The old pair were crossed capsules, which read as plus signs.
+    if (p.sparkle > 0) {
+      starMark(fb, 206, f.cy - 62 * s, 8.0f * p.sparkle * s, WHITE, a);
+      starMark(fb,  34, f.cy - 48 * s, 6.0f * p.sparkle * s, WHITE, a * .85f);
+    }
+  }
+
+  // A quad arc given in face-local coords, mirrored by side and mapped to screen.
+  void mappedArc(uint16_t* fb, const FaceXf& f, int side,
+                 float x0, float y0, float x1, float y1, float x2, float y2, float w, float a) {
+    float ax, ay, bx, by, cx2, cy2;
+    f.map(side * EYE_DX + x0, EYE_CY + y0, ax, ay);
+    f.map(side * EYE_DX + x1, EYE_CY + y1, bx, by);
+    f.map(side * EYE_DX + x2, EYE_CY + y2, cx2, cy2);
+    quadStroke(fb, ax, ay, bx, by, cx2, cy2, w, INK, a);
+  }
+
+  // ---------- span filling ----------
+  // Evaluating the distance field at every pixel of a big shape is what made
+  // this slow: the head alone is ~57k pixels at 4 sqrtf each. Instead, solve
+  // analytically for the x range the shape covers on each row, run the exact
+  // per-pixel maths only on the ~3 px at either edge, and store the interior
+  // straight into the framebuffer.
+
+  // Where does the row hit the ellipse? Along a row, local coordinates run
+  // lx = p1*px + q1 and ly = p2*px + q2, so substituting into the ellipse gives
+  // a quadratic in px. Returns false when the row misses.
+  static bool solveSpan(float p1, float q1, float p2, float q2,
+                        float rx, float ry, float& xa, float& xb) {
+    if (rx <= 0 || ry <= 0) return false;
+    float irx2 = 1.f / (rx * rx), iry2 = 1.f / (ry * ry);
+    float A = p1 * p1 * irx2 + p2 * p2 * iry2;
+    if (A <= 1e-12f) return false;
+    float B = 2.f * (p1 * q1 * irx2 + p2 * q2 * iry2);
+    float C = q1 * q1 * irx2 + q2 * q2 * iry2 - 1.f;
+    float disc = B * B - 4 * A * C;
+    if (disc <= 0) return false;
+    float sq = sqrtf(disc), inv = .5f / A;
+    xa = (-B - sq) * inv;
+    xb = (-B + sq) * inv;
+    return true;
+  }
+
+  static void fillRun(uint16_t* fb, int py, int xa, int xb, uint16_t solid) {
+    if (xa < 0) xa = 0;
+    if (xb > W - 1) xb = W - 1;
+    uint16_t* row = fb + (size_t)py * W;
+    for (int x = xa; x <= xb; x++) row[x] = solid;
+  }
+
+  // Paint one row of a shape that covers [xa, xb]: exact coverage at the two
+  // edges, flat fill between them. `dist` returns the screen-space signed
+  // distance at a pixel. EDGE is wide enough to cover the whole anti-aliased
+  // ramp plus rounding.
+  template <class Dist>
+  static void spanRow(uint16_t* fb, int py, float xa, float xb,
+                      uint32_t col, float a, Dist dist) {
+    static const int EDGE = 3;
+    if (py < 0 || py > H - 1) return;
+    int l0 = (int)floorf(xa) - EDGE, l1 = (int)ceilf(xa) + EDGE;
+    int r0 = (int)floorf(xb) - EDGE, r1 = (int)ceilf(xb) + EDGE;
+    if (l1 >= r0) {                               // narrow row: no interior
+      for (int px = l0; px <= r1; px++) plot(fb, px, py, col, a * cov(dist(px)));
+      return;
+    }
+    for (int px = l0; px <= l1; px++) plot(fb, px, py, col, a * cov(dist(px)));
+    if (a >= .997f) fillRun(fb, py, l1 + 1, r0 - 1, rgb565(col));
+    else for (int px = l1 + 1; px <= r0 - 1; px++) plot(fb, px, py, col, a);
+    for (int px = r0; px <= r1; px++) plot(fb, px, py, col, a * cov(dist(px)));
+  }
+
+  // Head = union of the dome and the jaw ellipse. Both are centred on the
+  // face axis, so a row either misses one of them or the two spans overlap;
+  // painting each span in turn covers the union either way, and the edge
+  // pixels use min(dome, jaw) so a seam never shows where they cross.
+  void headShape(uint16_t* fb, const FaceXf& f, float a) {
+    float Y0, Y1;
+    faceLocalRows(f, HEAD_CY - HEAD_RY - 2, JAW_CY + JAW_RY + 2, HEAD_RX + 2, Y0, Y1);
+    int y0 = (int)floorf(Y0), y1 = (int)ceilf(Y1);
+    if (y0 < 0) y0 = 0;
+    if (y1 > H - 1) y1 = H - 1;
+
+    const float p1 =  f.c * f.invS, p2 = -f.sn * f.invS;
+    const float k  = (.5f - f.cx) * f.invS;
+
+    for (int py = y0; py <= y1; py++) {
+      float v  = (py + .5f - f.cy) * f.invS;
+      float q1 =  f.c * k + f.sn * v;
+      float q2 = -f.sn * k + f.c * v;
+
+      auto dist = [&](int px) {
+        float lx = p1 * px + q1, ly = p2 * px + q2;
+        return fminf(sdEllipse(lx, ly - HEAD_CY, HEAD_RX, HEAD_RY),
+                     sdEllipse(lx, ly - JAW_CY,  JAW_RX,  JAW_RY)) * f.s;
+      };
+
+      float xa, xb;
+      if (solveSpan(p1, q1, p2, q2 - HEAD_CY, HEAD_RX, HEAD_RY, xa, xb))
+        spanRow(fb, py, xa, xb, FUR, a, dist);
+      if (solveSpan(p1, q1, p2, q2 - JAW_CY, JAW_RX, JAW_RY, xa, xb))
+        spanRow(fb, py, xa, xb, FUR, a, dist);
+    }
+  }
+
+  // Screen rows spanned by a face-local box, accounting for the head tilt.
+  static void faceLocalRows(const FaceXf& f, float lyTop, float lyBot, float lxMax,
+                            float& Y0, float& Y1) {
+    float slant = fabsf(f.sn) * lxMax;
+    Y0 = f.cy + (lyTop * f.c - slant) * f.s;
+    Y1 = f.cy + (lyBot * f.c + slant) * f.s;
+  }
+
+  // One eye patch: rotated ellipse with an optional black lid cut down from the top.
+  void patch(uint16_t* fb, float cx, float cy, float rx, float ry, float rot, float lid, float a) {
+    float c = cosf(rot), sn = sinf(rot), R = fmaxf(rx, ry) + 2;
+    float cutY = cy - screenRy(rx, ry, rot) * (1 - 2 * lid);   // horizontal lid edge
+    bool  cut  = lid > .001f;
+
+    int y0 = (int)floorf(cy - R), y1 = (int)ceilf(cy + R);
+    if (cut && y0 < (int)floorf(cutY) - 2) y0 = (int)floorf(cutY) - 2;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H - 1) y1 = H - 1;
+
+    const float p1 = c, p2 = -sn, k = .5f - cx;
+
+    for (int py = y0; py <= y1; py++) {
+      float dy = py + .5f - cy;
+      float q1 =  c * k + sn * dy;
+      float q2 = -sn * k + c * dy;
+      float lidD = cutY - (py + .5f);
+
+      auto dist = [&](int px) {
+        float d = sdEllipse(p1 * px + q1, p2 * px + q2, rx, ry);
+        return cut ? fmaxf(d, lidD) : d;
+      };
+
+      float xa, xb;
+      if (!solveSpan(p1, q1, p2, q2, rx, ry, xa, xb)) continue;
+      // Rows straddling the lid edge need the exact max() everywhere, so let
+      // spanRow fall into its narrow-row path by collapsing the interior.
+      if (cut && lidD > -1.5f && lidD < 1.5f)
+        for (int px = (int)floorf(xa) - 3; px <= (int)ceilf(xb) + 3; px++)
+          plot(fb, px, py, INK, a * cov(dist(px)));
+      else if (!cut || lidD <= -1.5f)
+        spanRow(fb, py, xa, xb, INK, a, dist);
+    }
+  }
+  // Half-height of a rotated ellipse as it appears on screen.
+  static float screenRy(float rx, float ry, float rot) {
+    float s = rx * sinf(rot), c = ry * cosf(rot);
+    return sqrtf(s * s + c * c);
+  }
+
+  // The eye itself: white sclera, black pupil that tracks the gaze, catch-light.
+  // The pupil is the same ink as the patch, so it still reads correctly when the
+  // gaze slides it far enough to touch the edge of the white.
+  void eyeBall(uint16_t* fb, float ex, float ey, float sc, float gx, float gy,
+               float a, float cutY, bool cut) {
+    if (sc <= .01f) return;
+    clipEllipse(fb, ex, ey, SCL_RX * sc, SCL_RY * sc, FUR, a, cutY, cut);
+    float px = ex + gx, py = ey + gy;
+    clipEllipse(fb, px, py, PUP_R * sc, (PUP_R + .5f) * sc, INK, a, cutY, cut);
+    clipEllipse(fb, px - 2.3f * sc, py - 2.7f * sc, 2.4f * sc, 2.4f * sc, WHITE, a, cutY, cut);
+  }
+
+  // Ellipse with an optional horizontal top cut (the eyelid).
+  void clipEllipse(uint16_t* fb, float cx, float cy, float rx, float ry,
+                   uint32_t col, float a, float cutY, bool cut) {
+    for (int py = (int)floorf(cy - ry) - 1; py <= (int)ceilf(cy + ry) + 1; py++) {
+      if (cut && py + .5f < cutY - 1) continue;
+      for (int px = (int)floorf(cx - rx) - 1; px <= (int)ceilf(cx + rx) + 1; px++) {
+        float d = sdEllipse(px + .5f - cx, py + .5f - cy, rx, ry);
+        if (cut) d = fmaxf(d, cutY - (py + .5f));
+        plot(fb, px, py, col, a * cov(d));
+      }
+    }
+  }
+
+
+  // ---------- SET TIMER screen ----------
+  // Near-black, generously spaced: the chosen minutes held inside a soft
+  // organic shape with a warm glow, JUNI looking up at it from below between
+  // two small accent marks, and one quiet line. No heading, no ring, no dots.
+  // Layout is entirely in the ORGANIC_* / SET_* / JUNI_SET_* / SPARK_* constants.
+  void drawSetTimerScreen(uint16_t* fb, uint32_t now, uint32_t t, int minutes) {
+    float fade = easeOut(seg(t, 60, 340));        // eases in behind the state change
+    if (fade <= .02f) return;
+
+    // A detent breathes the shape out by ORGANIC_BUMP and lets it settle. This
+    // is the only motion on the screen, and it is over in 170 ms.
+    float scale = 1.f;
+    if (bumpStart && now - bumpStart < 170) {
+      float k = (float)(now - bumpStart) / 170.f;
+      scale += ORGANIC_BUMP * sinf(3.14159265f * k) * (1 - k * .35f);
+    }
+
+    drawOrganicShape(fb, scale, fade);
+    drawSetTimerValue(fb, minutes, fade);
+    starMark(fb, ORGANIC_CENTER_X - SPARK_DX, SPARK_Y, SPARK_R, JUNI_PEACH_LIGHT, fade);
+    starMark(fb, ORGANIC_CENTER_X + SPARK_DX, SPARK_Y, SPARK_R * .84f, JUNI_PEACH_LIGHT, fade * .88f);
+    if (drawText) {
+      uint16_t c = rgb565(blend(UI_TEXT_SECONDARY, UI_BG, fade));
+      drawText(fb, "Press to start", SET_TIME_CENTER_X, START_TEXT_Y, START_TEXT_SIZE, c, c);
+    }
+  }
+
+  // The duration, as a setting rather than a countdown: a plain number and a
+  // much smaller MIN under it. Never MM:SS — that belongs to the running screen.
+  void drawSetTimerValue(uint16_t* fb, int minutes, float fade) {
+    char buf[8];
+    snprintf(buf, sizeof buf, "%d", minutes);
+    uint16_t c = rgb565(blend(UI_TEXT_MAIN, UI_BG, fade));
+    if (drawBigNumber)
+      drawBigNumber(fb, buf, SET_TIME_CENTER_X, SET_TIME_CENTER_Y,
+                    SET_TIME_FONT_SIZE, SET_TIME_MAX_W, c);
+    else if (drawText)
+      drawText(fb, buf, SET_TIME_CENTER_X, SET_TIME_CENTER_Y, 76, c, c);
+    if (drawText) {
+      uint16_t u = rgb565(blend(UI_TEXT_SECONDARY, UI_BG, fade * .92f));
+      drawText(fb, "MIN", SET_TIME_CENTER_X, SET_MIN_Y, SET_MIN_FONT_SIZE, u, u);
+    }
+  }
+
+  // One small four-pointed accent mark. Concave sides, so it reads as a soft
+  // spark rather than a plus or a dot.
+  void starMark(uint16_t* fb, float cx, float cy, float r, uint32_t col, float a) {
+    if (a <= .02f || r <= 0) return;
+    int x0 = (int)floorf(cx - r), x1 = (int)ceilf(cx + r);
+    int y0 = (int)floorf(cy - r), y1 = (int)ceilf(cy + r);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
+    for (int py = y0; py <= y1; py++) {
+      float ay = fabsf(py + .5f - cy) / r;
+      for (int px = x0; px <= x1; px++) {
+        float ax = fabsf(px + .5f - cx) / r;
+        if (ax + ay > 1.35f) continue;                  // cheap reject
+        // |x|^k + |y|^k = 1 with k below 1 pulls the sides inward into points.
+        float f = powf(ax, .62f) + powf(ay, .62f) - 1.f;
+        float cvg = cov(f * r * .42f);
+        if (cvg > 0) plot(fb, px, py, col, cvg * a);
+      }
+    }
+  }
+
+  // ---------- timer, caption, pill, dots: white only ----------
+  void drawInfo(uint16_t* fb, uint32_t now, uint32_t t, int minutes, int remaining) {
+    // The set-timer screen is composed on its own and shares nothing with the
+    // timer/pill/dots below: no heading, no pill, no dots.
+    if (state == TIME_SELECT) { drawSetTimerScreen(fb, now, t, minutes); return; }
+
+    const Pose& p = cur;
+    char buf[16]; const char* pillText = "Ready";
+    float ta = p.timerAlpha, tpx = p.timerPx, ty = p.timerY;
+
+    switch (state) {
+      case TIME_SELECT: return;            // composed above, never reaches here
+      case IDLE:
+        snprintf(buf, sizeof buf, "%d:00", minutes); break;
+      // Zero-padded, so 9:59 does not become one digit narrower than 10:00.
+      // The bundled digits are tabular, so with a fixed digit count every
+      // value occupies exactly the same pixels.
+      case STARTING:
+        snprintf(buf, sizeof buf, "%02d:%02d", remaining / 60, remaining % 60);
+        pillText = "Let's go"; break;
+      case FOCUS: case BREAK: case CANCELING:
+        snprintf(buf, sizeof buf, "%02d:%02d", remaining / 60, remaining % 60);
+        pillText = state == BREAK ? "Break" : state == CANCELING ? "Cancelled" : "Focusing"; break;
+      case FINISHED:
+        if (t < 500) { snprintf(buf, sizeof buf, "0:00"); ta = 1 - easeIn(seg(t, 200, 500)); }
+        else { snprintf(buf, sizeof buf, "+%d min", minutes); tpx = 44; ta = easeOut(seg(t, 500, 700)); }
+        pillText = "Well done!"; break;
+    }
+
+    // One colour for the whole string, always. Passing a different colour for
+    // the colon is what used to make it pulse once a second, and it also sent
+    // the text hook down a path that measured and placed the three pieces
+    // separately, so the layout moved as well as the brightness.
+    uint16_t col = rgb565(blend(WHITE, BLACK, ta));
+    if (drawText && ta > .02f) drawText(fb, buf, 120, (int)ty, (int)tpx, col, col);
+
+    // Idle swaps the status pill for a quiet, slowly breathing hint.
+    if (p.capAlpha > .02f && drawText) {
+      float br = .58f + .20f * sinf(6.2831853f * (now % 3600) / 3600.f);
+      uint16_t cc = rgb565(blend(WHITE, BLACK, p.capAlpha * br));
+      drawText(fb, "turn to set", 120, 278, 13, cc, cc);
+    }
+
+    if (p.pillAlpha > .02f) {
+      float pw = strlen(pillText) * 8 + 26;
+      roundRect(fb, 120 - pw / 2, 268, pw, 24, 12, PILL_BG, p.pillAlpha);
+      uint16_t pc = rgb565(blend(WHITE, BLACK, p.pillAlpha));
+      if (drawText) drawText(fb, pillText, 120, 280, 13, pc, pc);
+    }
+
+    if (state == IDLE) {
+      // three dots with a pulse travelling across them, like a slow heartbeat
+      for (int i = 0; i < 3; i++) {
+        float ph = (float)(now % 2400) / 2400.f - i * .13f;
+        float w  = .5f + .5f * sinf(6.2831853f * ph);
+        w = w * w * w;
+        circle(fb, 120 + (i - 1) * 13, 306, 2.2f + 1.0f * w, WHITE, lerp(.20f, .95f, w));
+      }
+    }
+    // No dot under Focusing / Break / Cancelled: it carried no meaning.
+  }
+
+  // ---------- SDF rasteriser ----------
+  static uint16_t rgb565(uint32_t c) { return (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x1F)); }
+  static uint32_t from565(uint16_t c) { uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31; return ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31); }
+  static uint32_t blend(uint32_t a, uint32_t b, float t) {
+    t = clamp01(t);
+    uint32_t r  = (uint32_t)(((a >> 16) & 255) * t + ((b >> 16) & 255) * (1 - t));
+    uint32_t g  = (uint32_t)(((a >> 8)  & 255) * t + ((b >> 8)  & 255) * (1 - t));
+    uint32_t bl = (uint32_t)(( a        & 255) * t + ( b        & 255) * (1 - t));
+    return (r << 16) | (g << 8) | bl;
+  }
+  static void plot(uint16_t* fb, int x, int y, uint32_t col, float cvg) {
+    if (x < 0 || y < 0 || x >= W || y >= H || cvg <= 0.003f) return;
+    uint16_t& px = fb[y * W + x];
+    if (cvg >= .997f) { px = rgb565(col); return; }
+    px = rgb565(blend(col, from565(px), cvg));
+  }
+  static float cov(float d) { return clamp01(.5f - d); }
+  // Approximate signed distance to an axis-aligned ellipse centred at the origin.
+  static float sdEllipse(float x, float y, float rx, float ry) {
+    if (rx <= 0 || ry <= 0) return 1e6f;
+    float nx = x / rx, ny = y / ry;
+    float k1 = sqrtf(nx * nx + ny * ny);
+    float gx = nx / rx, gy = ny / ry;
+    float k2 = sqrtf(gx * gx + gy * gy);
+    return k2 > 1e-6f ? (k1 - 1) / k2 : (k1 - 1) * fminf(rx, ry);
+  }
+  static float sdRR(float px, float py, float x, float y, float w, float h, float r) {
+    float qx = fabsf(px - (x + w / 2)) - (w / 2 - r), qy = fabsf(py - (y + h / 2)) - (h / 2 - r);
+    float ax = fmaxf(qx, 0), ay = fmaxf(qy, 0);
+    return sqrtf(ax * ax + ay * ay) + fminf(fmaxf(qx, qy), 0) - r;
+  }
+  void roundRect(uint16_t* fb, float x, float y, float w, float h, float r, uint32_t col, float a) {
+    for (int py = (int)floorf(y) - 1; py <= (int)ceilf(y + h) + 1; py++)
+      for (int px = (int)floorf(x) - 1; px <= (int)ceilf(x + w) + 1; px++)
+        plot(fb, px, py, col, a * cov(sdRR(px + .5f, py + .5f, x, y, w, h, r)));
+  }
+  // ---------- the soft organic shape ----------
+  // The shape is the smooth-minimum union of six offset circles. That gives
+  // asymmetric, entirely rounded curves with no Bezier evaluation, and the
+  // union has a usable signed distance field, which is what makes the glow
+  // possible. Offsets and radii are fractions of the shape's half-size, so
+  // ORGANIC_WIDTH / ORGANIC_HEIGHT scale everything together.
+  struct Lobe { float ox, oy, r; };
+
+  // One dominant central disc plus six bumps riding on it. The central disc is
+  // what keeps the interior uniformly deep: six bumps alone leave the middle
+  // barely covered, which shows up as dark patches under the glow. The bumps
+  // reach out to between .81 and .95, so some protrude and some barely do —
+  // that unevenness is what stops it reading as a flower.
+  static constexpr int BLOB_N = 7;
+  static const Lobe* blobLobes() {
+    static const Lobe L[BLOB_N] = {
+      {  .000f,  .000f, .82f },   // the body
+      {  .450f,  .096f, .46f },   // reach .92
+      {  .116f,  .404f, .40f },   //       .82, nearly flush
+      { -.372f,  .335f, .45f },   //       .95
+      { -.423f, -.121f, .42f },   //       .86
+      { -.100f, -.469f, .47f },   //       .95
+      {  .297f, -.268f, .41f },   //       .81, nearly flush
+    };
+    return L;
+  }
+
+  // Polynomial smooth minimum: blends the two distances near where they cross,
+  // which is what rounds the joins between lobes instead of creasing them.
+  static float smin(float a, float b, float k) {
+    float h = clamp01(.5f + .5f * (b - a) / k);
+    return lerp(b, a, h) - k * h * (1 - h);
+  }
+
+  static float blobSD(float nx, float ny) {
+    const Lobe* L = blobLobes();
+    float dx = nx - L[0].ox, dy = ny - L[0].oy;
+    float d = sqrtf(dx * dx + dy * dy) - L[0].r;
+    for (int i = 1; i < BLOB_N; i++) {
+      dx = nx - L[i].ox; dy = ny - L[i].oy;
+      d = smin(d, sqrtf(dx * dx + dy * dy) - L[i].r, .155f);
+    }
+    return d;
+  }
+
+  // One lattice row: the distance in px, and the directional lighting term.
+  // Lighting from two directions, so parts of the border stay dim — a uniform
+  // outline is what makes this kind of shape look technical.
+  static void blobRow(float* dst, float* lit, int x0, int n, int step, int py,
+                      float cx, float cy, float rx, float ry, float rAvg) {
+    float ny = ((float)py + .5f - cy) / ry;
+    for (int i = 0; i < n; i++) {
+      float nx = ((float)(x0 + i * step) + .5f - cx) / rx;
+      dst[i] = blobSD(nx, ny) * rAvg;
+      float gA = clamp01(.34f + 1.15f * (nx * -.42f + ny * -.91f));   // top, a little left
+      float gB = clamp01(.02f + 1.15f * (nx *  .80f + ny *  .60f));   // lower right
+      lit[i] = .28f + .72f * clamp01(fmaxf(gA, gB * .88f));
+    }
+  }
+
+  // The glow is smooth and low frequency, so the distance field is solved only
+  // on a quarter-resolution lattice and interpolated; that is ~16x less
+  // distance-field work than evaluating every pixel, and it is what makes a
+  // real per-pixel gradient affordable here instead of a few stacked outlines.
+  //
+  // Everything else that can leave the inner loop has: the glow profile is a
+  // function of distance alone, so it becomes a 1-D table; the colour ramp is a
+  // function of intensity alone, so it becomes another (with the screen fade
+  // folded in); and the directional lighting is smooth, so it rides the same
+  // lattice as the distance. The inner loop is then two interpolations and two
+  // lookups.
+  void drawOrganicShape(uint16_t* fb, float scale, float fade) {
+    const float cx = ORGANIC_CENTER_X, cy = ORGANIC_CENTER_Y;
+    const float rx = ORGANIC_WIDTH * .5f * scale, ry = ORGANIC_HEIGHT * .5f * scale;
+    const float rAvg = (rx + ry) * .5f;
+    const float out = ORGANIC_GLOW_OUT, in = ORGANIC_GLOW_IN;
+
+    int x0 = (int)floorf(cx - rx - out), x1 = (int)ceilf(cx + rx + out);
+    int y0 = (int)floorf(cy - ry - out), y1 = (int)ceilf(cy + ry + out);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > W - 1) x1 = W - 1;
+    if (y1 > H - 1) y1 = H - 1;
+
+    // Intensity against distance. A narrow bright band rides the edge and a
+    // broad faint bloom surrounds it; one wide band alone reads as a fat donut,
+    // two read as an edge that is glowing.
+    const int PROF_N = 160;
+    uint8_t prof[PROF_N];
+    const float profScale = (float)(PROF_N - 1) / (in + out);
+    for (int i = 0; i < PROF_N; i++) {
+      float d = (float)i / profScale - in;
+      float rim  = d >= 0 ? 1.f - d / (out * .42f) : 1.f + d / (in * .34f);
+      float halo = d >= 0 ? 1.f - d / out          : 1.f + d / in;
+      rim  = clamp01(rim);  rim  = rim * rim * (3.f - 2.f * rim);
+      halo = clamp01(halo); halo = halo * halo * (3.f - 2.f * halo);
+      prof[i] = (uint8_t)(clamp01(rim + halo * .34f) * 255.f + .5f);
+    }
+
+    // Colour against intensity, with the screen fade already applied. 64 steps
+    // is finer than RGB565 can show.
+    const int RAMP_N = 64;
+    uint16_t ramp[RAMP_N];
+    for (int i = 0; i < RAMP_N; i++) {
+      float tt = (float)i / (float)(RAMP_N - 1);
+      uint32_t c;
+      if (tt < .45f)      c = blend(JUNI_PEACH_DARK,  UI_BG,           tt / .45f);
+      else if (tt < .80f) c = blend(JUNI_PEACH,       JUNI_PEACH_DARK, (tt - .45f) / .35f);
+      else                c = blend(JUNI_PEACH_LIGHT, JUNI_PEACH,      (tt - .80f) / .20f);
+      ramp[i] = rgb565(blend(c, UI_BG, fade));
+    }
+
+    const int S = 4;                                  // lattice step
+    const int NMAX = W / S + 2;
+    int n = (x1 - x0) / S + 2;
+    if (n > NMAX) n = NMAX;
+
+    float dTop[NMAX], dBot[NMAX], lTop[NMAX], lBot[NMAX];
+    float* dt = dTop; float* db = dBot;
+    float* lt = lTop; float* lb = lBot;
+
+    int yl = y0;
+    blobRow(dt, lt, x0, n, S, yl, cx, cy, rx, ry, rAvg);
+    while (yl <= y1) {
+      int yn = yl + S;
+      if (yn > y1 + 1) yn = y1 + 1;
+      blobRow(db, lb, x0, n, S, yn, cx, cy, rx, ry, rAvg);
+      float invBand = 1.f / (float)(yn - yl);
+
+      for (int py = yl; py < yn; py++) {
+        float fy = (float)(py - yl) * invBand;
+        uint16_t* row = fb + (size_t)py * W;
+
+        for (int i = 0; i < n - 1; i++) {
+          float dl = lerp(dt[i], db[i], fy);
+          float dr = lerp(dt[i + 1], db[i + 1], fy);
+          float ll = lerp(lt[i], lb[i], fy);
+          float lr = lerp(lt[i + 1], lb[i + 1], fy);
+
+          for (int k = 0; k < S; k++) {
+            int px = x0 + i * S + k;
+            if (px > x1) break;
+            float f = (float)k * (1.f / (float)S);
+            float d = dl + (dr - dl) * f;
+            if (d >= out || d <= -in) continue;       // past the glow, or deep inside
+            float tt = (float)prof[(int)((d + in) * profScale)] * (1.f / 255.f)
+                     * (ll + (lr - ll) * f);
+            if (tt <= .012f) continue;
+            row[px] = ramp[(int)(tt * (float)(RAMP_N - 1) + .5f)];
+          }
+        }
+      }
+      float* sd = dt; dt = db; db = sd;
+      float* sl = lt; lt = lb; lb = sl;
+      yl = yn;
+    }
+  }
+
+  void circle(uint16_t* fb, float cx, float cy, float r, uint32_t col, float a) {
+    if (r <= 0) return;
+    int y0 = (int)floorf(cy - r) - 1, y1 = (int)ceilf(cy + r) + 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H - 1) y1 = H - 1;
+    const float r2 = r * r;
+    for (int py = y0; py <= y1; py++) {
+      float dy = py + .5f - cy, h2 = r2 - dy * dy;
+      float h = h2 > 0 ? sqrtf(h2) : 0;            // 0 at the caps: all edge, no interior
+      auto dist = [&](int px) {
+        float dx = px + .5f - cx;
+        return sqrtf(dx * dx + dy * dy) - r;
+      };
+      spanRow(fb, py, cx - h, cx + h, col, a, dist);
+    }
+  }
+  void ellipse(uint16_t* fb, float cx, float cy, float rx, float ry, uint32_t col, float a) {
+    for (int py = (int)floorf(cy - ry) - 1; py <= (int)ceilf(cy + ry) + 1; py++)
+      for (int px = (int)floorf(cx - rx) - 1; px <= (int)ceilf(cx + rx) + 1; px++)
+        plot(fb, px, py, col, a * cov(sdEllipse(px + .5f - cx, py + .5f - cy, rx, ry)));
+  }
+  void capsule(uint16_t* fb, float ax, float ay, float bx, float by, float r, uint32_t col, float a) {
+    float vx = bx - ax, vy = by - ay, len2 = vx * vx + vy * vy;
+    for (int py = (int)(fminf(ay, by) - r - 1); py <= (int)(fmaxf(ay, by) + r + 1); py++)
+      for (int px = (int)(fminf(ax, bx) - r - 1); px <= (int)(fmaxf(ax, bx) + r + 1); px++) {
+        float qx = px + .5f - ax, qy = py + .5f - ay;
+        float t = len2 > 0 ? clamp01((qx * vx + qy * vy) / len2) : 0;
+        float dx = qx - t * vx, dy = qy - t * vy;
+        plot(fb, px, py, col, a * cov(sqrtf(dx * dx + dy * dy) - r));
+      }
+  }
+  void quadStroke(uint16_t* fb, float x0, float y0, float cx, float cy, float x1, float y1, float w, uint32_t col, float a) {
+    const int N = 10; float ax = x0, ay = y0;
+    for (int i = 1; i <= N; i++) {
+      float t = (float)i / N, u = 1 - t;
+      float bx = u * u * x0 + 2 * u * t * cx + t * t * x1, by = u * u * y0 + 2 * u * t * cy + t * t * y1;
+      capsule(fb, ax, ay, bx, by, w / 2, col, a);
+      ax = bx; ay = by;
+    }
+  }
+};
