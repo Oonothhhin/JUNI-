@@ -1,0 +1,1018 @@
+// JUNI — full focus-companion firmware
+// Arduino IDE version adapted to the CURRENT working juni_well_done hardware setup.
+//
+// Hardware kept exactly on the current JUNI pins:
+//   TFT: CS 10, RST 9, DC 4, MOSI 11, SCLK 12 (MISO 13 optional)
+//   Encoder: S1 6, S2 7, KEY 8
+//
+// Display stack kept from the current working sketch:
+//   Adafruit_GFX + Adafruit_ST7789
+//
+// Visual layer:
+//   juni_ui.h = all 7 product states + expressions + transitions
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <string.h>
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+
+#include "juni_idle.h"
+#include "juni_digits.h"
+
+
+// ============================================================
+// IMPORTANT ARDUINO IDE TYPE DECLARATIONS
+// ============================================================
+//
+// Arduino auto-generates function prototypes near the top of a .ino file.
+// Any custom return/argument type used by those functions must already be
+// declared before Arduino inserts those prototypes.
+//
+// Keeping these here fixes errors like:
+//   'PressType' does not name a type
+//   'JuniState' was not declared in this scope
+//
+enum PressType : uint8_t {
+  PRESS_NONE,
+  PRESS_SHORT,
+  PRESS_LONG
+};
+
+// Everything one call to readButton() can report.
+struct ButtonEvents {
+  bool down;         // debounced press edge (finger just went down)
+  bool up;           // debounced release edge
+  PressType press;   // SHORT fires on release, LONG fires while still held
+};
+
+// THE STATE MACHINE
+//
+// JUNI is always in exactly one of these states, held in `currentState`.
+// Each state decides what the knob does, and a state only changes inside
+// enterState(). That is what keeps the behaviour predictable: to know what a
+// press does, find the current state's case in updateCurrentState().
+//
+// JuniUI (juni_idle.h) has its own list of *screens*. toUiState() maps each
+// application state onto the screen that already shows it, so no visuals
+// changed. The one naming difference: PAUSED is drawn with the UI's existing
+// BREAK screen, which has always been the pause screen ("Break" pill).
+enum class JuniState : uint8_t {
+  IDLE,       // resting panda, "turn to set"
+  SET_TIME,   // choosing the minutes
+  STARTING,   // 0.7 s "Let's go" bridge before the countdown
+  FOCUSING,   // countdown running
+  PAUSED,     // countdown frozen
+  COMPLETE,   // "Well done!"
+  CANCELLED   // 1.2 s "Cancelled", then back to IDLE
+};
+
+
+// ============================================================
+// 1. CURRENT JUNI HARDWARE
+// ============================================================
+
+// ---------- TFT ----------
+#define TFT_CS     10
+#define TFT_RST     9
+#define TFT_DC      4
+#define TFT_MOSI   11
+#define TFT_SCLK   12
+#define TFT_MISO   13     // optional / currently not required
+
+// ---------- Rotary encoder ----------
+#define ENC_S1      6
+#define ENC_S2      7
+#define ENC_KEY     8
+
+// Change to 1 only if clockwise decreases the time.
+#define ENC_INVERT  0
+
+// Most KY-040-style encoders generate 4 quadrature steps per click.
+// If one physical click does not equal one 5-minute change, try 2.
+#define ENC_STEPS_PER_DETENT 4
+
+#define TFT_SPI_HZ 40000000
+
+// ---------- TFT backlight (BL / BLK / LED pin on the display) ----------
+// -1 = not connected to the ESP32. That is the current wiring: nothing in this
+// firmware has ever driven the backlight, so it is either tied to 3.3 V or left
+// on the module's own pull-up. The dimming logic still runs and logs, but the
+// screen cannot actually get darker until BL goes to a GPIO.
+//
+// To enable real dimming: run a wire from the display's BL pin to a free GPIO
+// (GPIO 5 is a good choice on this board) and set that number here.
+#define TFT_BL_PIN  -1
+
+
+// ============================================================
+// 2. PRODUCT RULES
+// ============================================================
+
+static constexpr int MIN_MINUTES     = 5;
+static constexpr int MAX_MINUTES     = 120;
+static constexpr int STEP_MINUTES    = 5;
+static constexpr int DEFAULT_MINUTES = 25;
+
+static constexpr uint32_t LONG_PRESS_MS      = 1500;
+static constexpr uint32_t BUTTON_DEBOUNCE_MS = 25;
+static constexpr uint32_t SELECT_TIMEOUT_MS  = 5000;
+static constexpr uint32_t STARTING_MS        = 700;
+static constexpr uint32_t CANCELING_MS       = 1200;
+static constexpr uint32_t FRAME_MS           = 33;   // about 30 FPS
+
+// ---------- idle dimming ----------
+// Brightness is in percent (0-100). Only the IDLE screen auto-dims.
+static constexpr uint32_t IDLE_DIM_TIMEOUT_MS       = 20000;
+static constexpr uint8_t  DISPLAY_BRIGHTNESS_ACTIVE = 100;
+static constexpr uint8_t  DISPLAY_BRIGHTNESS_DIM    = 15;
+static constexpr uint32_t DIM_FADE_MS               = 500;   // slow fade down
+static constexpr uint32_t WAKE_FADE_MS              = 120;   // quick fade back up
+
+// Backlight PWM. 8-bit gives 256 duty steps, far finer than the eye needs.
+// 5 kHz is well above visible flicker.
+static constexpr uint32_t BL_PWM_FREQ_HZ  = 5000;
+static constexpr uint8_t  BL_PWM_RES_BITS = 8;
+
+
+// ============================================================
+// 3. DISPLAY + FRAMEBUFFER
+// ============================================================
+
+Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
+
+uint16_t *frameBuffer = nullptr;
+
+
+// Adafruit_GFX normally draws directly to a display.
+// This tiny wrapper makes it draw text into JUNI's RGB565 framebuffer.
+class FrameBufferGFX : public Adafruit_GFX {
+public:
+  uint16_t *buffer = nullptr;
+
+  FrameBufferGFX() : Adafruit_GFX(JuniUI::W, JuniUI::H) {}
+
+  void setBuffer(uint16_t *b) {
+    buffer = b;
+  }
+
+  void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+    if (!buffer) return;
+    if (x < 0 || y < 0 || x >= JuniUI::W || y >= JuniUI::H) return;
+    buffer[y * JuniUI::W + x] = color;
+  }
+};
+
+FrameBufferGFX textRenderer;
+JuniUI ui;
+
+
+// ============================================================
+// 4. TEXT RENDERING FOR juni_ui.h
+// ============================================================
+
+static const GFXfont *fontForPixelHeight(int px) {
+  if (px >= 48) return &FreeSansBold24pt7b;
+  if (px >= 32) return &FreeSansBold18pt7b;
+  if (px >= 18) return &FreeSansBold12pt7b;
+  return &FreeSansBold9pt7b;
+}
+
+static void drawCenteredText(
+  const char *text,
+  int cx,
+  int cy,
+  uint16_t color,
+  const GFXfont *font
+) {
+  textRenderer.setFont(font);
+  textRenderer.setTextSize(1);
+  textRenderer.setTextColor(color);
+  textRenderer.setTextWrap(false);
+
+  int16_t x1, y1;
+  uint16_t w, h;
+  textRenderer.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+
+  // Horizontal centring uses the pen advance, NOT the ink bounds. getTextBounds
+  // returns the ink box, and digits do not all ink the same width -- a '1' is
+  // narrower than a '0' -- so centring on ink slides the whole countdown
+  // sideways every time a digit changes. The advance is identical for any two
+  // strings of the same characters' widths, and these digits are tabular, so
+  // advance-centring pins every glyph to the same pixel column each second.
+  int advance = 0;
+  for (const char *p = text; *p; p++) {
+    if ((uint8_t)*p < font->first || (uint8_t)*p > font->last) continue;
+    advance += font->glyph[*p - font->first].xAdvance;
+  }
+
+  int cursorX = cx - advance / 2;
+  int cursorY = cy - ((int)h / 2) - y1;   // vertical ink centring is stable here
+
+  textRenderer.setCursor(cursorX, cursorY);
+  textRenderer.print(text);
+}
+
+
+// juni_ui.h asks for one generic text callback.
+// It can optionally pulse the ":" separately during focus.
+static void drawTextHook(
+  uint16_t *fb,
+  const char *text,
+  int cx,
+  int cy,
+  int px,
+  uint16_t color,
+  uint16_t colonColor
+) {
+  textRenderer.setBuffer(fb);
+
+  // Deliberately one colour and one layout for the whole string. This used to
+  // branch on colonColor and draw the timer as three separately measured
+  // pieces so the colon could pulse; that made the countdown shift sideways as
+  // well as flicker. colonColor is kept in the signature for compatibility and
+  // is ignored.
+  (void)colonColor;
+  drawCenteredText(text, cx, cy, color, fontForPixelHeight(px));
+}
+
+
+// ============================================================
+// 4b. OVERSIZED NUMBER FOR THE SET TIMER SCREEN
+// ============================================================
+//
+// Adafruit_GFX only bundles fonts up to FreeSansBold24pt7b, whose digits are
+// ~34 px tall, and the SET TIMER screen wants its number considerably bigger.
+// Upscaling the bundled master was tried and does not work: a 1-bit bitmap
+// carries no sub-pixel edge information, so every scaling method leaves the
+// source pixel staircase visible on the curves.
+//
+// So the numerals live in juni_digits.h at their real size, as 8-bit coverage
+// rendered from Arial Rounded MT Bold. Blending that coverage gives properly
+// anti-aliased edges, and the rounded face suits the screen.
+//
+// One scale is used for the whole string, limited by BOTH a cap height and a
+// maximum width, so "120" renders a little smaller than "45" rather than
+// running into the shape around it. Scaling here is only ever downward, where
+// bilinear sampling of an 8-bit source is clean.
+
+static uint16_t blend565(uint16_t a, uint16_t b, float t) {
+  int ar = (a >> 11) & 31, ag = (a >> 5) & 63, ab = a & 31;
+  int br = (b >> 11) & 31, bg = (b >> 5) & 63, bb = b & 31;
+  int r  = (int)(ar * t + br * (1 - t) + .5f);
+  int g  = (int)(ag * t + bg * (1 - t) + .5f);
+  int bl = (int)(ab * t + bb * (1 - t) + .5f);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+// Coverage at a point inside one glyph's alpha map, bilinearly sampled.
+static inline float digitAlpha(const JuniDigit &g, float gx, float gy) {
+  int x0 = (int)floorf(gx), y0 = (int)floorf(gy);
+  float fx = gx - (float)x0, fy = gy - (float)y0;
+  float v[4];
+
+  for (int i = 0; i < 4; i++) {
+    int x = x0 + (i & 1), y = y0 + (i >> 1);
+    v[i] = (x < 0 || y < 0 || x >= (int)g.w || y >= (int)g.h)
+           ? 0.f
+           : (float)JUNI_DIGIT_ALPHA[g.off + (size_t)y * g.w + x] * (1.f / 255.f);
+  }
+
+  float top = v[0] + (v[1] - v[0]) * fx;
+  float bot = v[2] + (v[3] - v[2]) * fx;
+  return top + (bot - top) * fy;
+}
+
+static void drawBigNumberHook(
+  uint16_t *fb,
+  const char *text,
+  int cx,
+  int cy,
+  int capPx,
+  int maxW,
+  uint16_t color
+) {
+  int n = (int)strlen(text);
+  if (n <= 0) return;
+
+  // Ink bounds at 1:1, so the string centres on its shape rather than on its
+  // advance widths. Digits are tabular, so the pen simply steps by ADV.
+  float inkL = 1e9f, inkR = -1e9f;
+
+  for (int i = 0; i < n; i++) {
+    if (text[i] < '0' || text[i] > '9') return;
+    const JuniDigit &g = JUNI_DIGITS[text[i] - '0'];
+    float pen = (float)i * JUNI_DIGIT_ADV;
+    if (pen + g.xo < inkL) inkL = pen + g.xo;
+    if (pen + g.xo + g.w > inkR) inkR = pen + g.xo + g.w;
+  }
+
+  float inkW = inkR - inkL;
+  float inkH = (float)(JUNI_DIGIT_BOT - JUNI_DIGIT_TOP);
+
+  float k = (float)capPx / (float)JUNI_DIGIT_CAP;
+  if (inkW * k > (float)maxW) k = (float)maxW / inkW;
+
+  float originX = (float)cx - inkW * k * .5f - inkL * k;
+  float originY = (float)cy - inkH * k * .5f - (float)JUNI_DIGIT_TOP * k;
+
+  for (int i = 0; i < n; i++) {
+    const JuniDigit &g = JUNI_DIGITS[text[i] - '0'];
+
+    float gx0 = originX + ((float)i * JUNI_DIGIT_ADV + g.xo) * k;
+    float gy0 = originY + (float)g.yo * k;
+
+    int px0 = (int)floorf(gx0), px1 = (int)ceilf(gx0 + g.w * k);
+    int py0 = (int)floorf(gy0), py1 = (int)ceilf(gy0 + g.h * k);
+
+    if (px0 < 0) px0 = 0;
+    if (py0 < 0) py0 = 0;
+    if (px1 > JuniUI::W) px1 = JuniUI::W;
+    if (py1 > JuniUI::H) py1 = JuniUI::H;
+
+    float invK = 1.f / k;
+
+    for (int py = py0; py < py1; py++) {
+      float gy = ((float)py + .5f - gy0) * invK - .5f;
+
+      for (int px = px0; px < px1; px++) {
+        float gx = ((float)px + .5f - gx0) * invK - .5f;
+        float cov = digitAlpha(g, gx, gy);
+
+        if (cov <= .012f) continue;
+        if (cov > 1.f) cov = 1.f;
+
+        size_t idx = (size_t)py * JuniUI::W + px;
+        fb[idx] = (cov >= .996f) ? color : blend565(color, fb[idx], cov);
+      }
+    }
+  }
+}
+
+// Push the completed 240x320 framebuffer to the physical TFT.
+static void pushFrame() {
+  tft.startWrite();
+  tft.setAddrWindow(0, 0, JuniUI::W, JuniUI::H);
+  tft.writePixels(frameBuffer, (uint32_t)JuniUI::W * JuniUI::H, true);
+  tft.endWrite();
+}
+
+
+// ============================================================
+// 5. ROTARY ENCODER
+// ============================================================
+
+// Interrupt decoding is used because a full 240x320 frame takes time to send.
+// This prevents dial clicks from being missed while the display is updating.
+static volatile int32_t encSteps = 0;
+static volatile uint8_t encHistory = 0;
+
+static const int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+void IRAM_ATTR encoderISR() {
+  uint8_t current =
+    (digitalRead(ENC_S1) << 1) |
+     digitalRead(ENC_S2);
+
+  encHistory =
+    ((encHistory << 2) | current) & 0x0F;
+
+  encSteps += ENC_TABLE[encHistory];
+}
+
+static int32_t encoderAccum = 0;
+
+// Returns whole detents (clicks) turned since the last call.
+// rawSteps receives every quadrature step seen, including ones that do not yet
+// add up to a full click, so the screen can wake on the first hint of movement.
+static int takeEncoderDetents(int32_t &rawSteps) {
+  noInterrupts();
+  int32_t steps = encSteps;
+  encSteps = 0;
+  interrupts();
+
+  rawSteps = steps;
+  encoderAccum += steps;
+
+  int detents =
+    encoderAccum / ENC_STEPS_PER_DETENT;
+
+  encoderAccum -=
+    detents * ENC_STEPS_PER_DETENT;
+
+#if ENC_INVERT
+  detents = -detents;
+#endif
+
+  return detents;
+}
+
+
+// ============================================================
+// 6. ROTARY BUTTON — SHORT + LONG PRESS
+// ============================================================
+
+static bool buttonRawLast = false;
+static bool buttonStable = false;
+static bool longPressFired = false;
+
+static uint32_t buttonRawChangedAt = 0;
+static uint32_t buttonDownAt = 0;
+
+static ButtonEvents readButton(uint32_t now) {
+  ButtonEvents ev = { false, false, PRESS_NONE };
+
+  bool rawPressed =
+    (digitalRead(ENC_KEY) == LOW);
+
+  if (rawPressed != buttonRawLast) {
+    buttonRawLast = rawPressed;
+    buttonRawChangedAt = now;
+  }
+
+  if (
+    rawPressed != buttonStable &&
+    now - buttonRawChangedAt >= BUTTON_DEBOUNCE_MS
+  ) {
+    buttonStable = rawPressed;
+
+    if (buttonStable) {
+      buttonDownAt = now;
+      longPressFired = false;
+      ev.down = true;
+    } else {
+      ev.up = true;
+      if (!longPressFired) {
+        ev.press = PRESS_SHORT;
+      }
+    }
+  }
+
+  if (
+    buttonStable &&
+    !longPressFired &&
+    now - buttonDownAt >= LONG_PRESS_MS
+  ) {
+    longPressFired = true;
+    ev.press = PRESS_LONG;
+  }
+
+  return ev;
+}
+
+
+// ============================================================
+// 7. APPLICATION STATE
+// ============================================================
+//
+// A note on time: millis() is the number of milliseconds since boot. Every
+// timeout here is written as `now - someEarlierMillis >= duration`. With
+// unsigned maths that subtraction stays correct even when millis() wraps back
+// to 0 after ~49.7 days.
+//
+// And on delay(): delay(1000) freezes the whole loop for a second. The knob
+// would go unread, the countdown display would stall and animations would
+// stop. So nothing in loop() waits. Each part checks "is it time yet?" and
+// returns immediately if not.
+
+static JuniState currentState = JuniState::IDLE;
+static uint32_t  stateEnteredAt = 0;
+
+static int      selectedMinutes = DEFAULT_MINUTES;
+static int32_t  remainingMs = 0;    // what the countdown shows
+static uint32_t focusEndsAt = 0;    // millis() at which FOCUSING reaches 00:00
+
+// Input for this loop pass, filled in by updateInput().
+static int       inDetents = 0;
+static PressType inPress   = PRESS_NONE;
+
+// Set by the state machine, consumed by updateDisplay() (the number "bump").
+static int pendingBumpDir = 0;
+
+
+static const char *stateName(JuniState s) {
+  switch (s) {
+    case JuniState::IDLE:      return "IDLE";
+    case JuniState::SET_TIME:  return "SET_TIME";
+    case JuniState::STARTING:  return "STARTING";
+    case JuniState::FOCUSING:  return "FOCUSING";
+    case JuniState::PAUSED:    return "PAUSED";
+    case JuniState::COMPLETE:  return "COMPLETE";
+    case JuniState::CANCELLED: return "CANCELLED";
+  }
+  return "?";
+}
+
+
+// ============================================================
+// 8. BACKLIGHT + POWER MANAGEMENT
+// ============================================================
+//
+// How backlight PWM works: the backlight LEDs can only be fully on or fully
+// off. PWM (pulse-width modulation) switches them thousands of times a second,
+// too fast to see, and the fraction of time spent ON (the "duty cycle") becomes
+// the perceived brightness. The ESP32's LEDC peripheral generates that signal
+// in hardware, so it costs no CPU once set.
+//
+// lastInteractionMs = millis() at the last time someone touched the knob
+// (turned or pressed). IDLE dims once that is IDLE_DIM_TIMEOUT_MS in the past.
+
+static uint32_t lastInteractionMs = 0;
+static bool     displayDimmed = false;
+
+// Non-blocking fade: remember where it started and where it is going, and
+// work out the level from the clock on every loop pass.
+static uint8_t  blFrom = DISPLAY_BRIGHTNESS_ACTIVE;
+static uint8_t  blTo = DISPLAY_BRIGHTNESS_ACTIVE;
+static uint8_t  blWritten = DISPLAY_BRIGHTNESS_ACTIVE;
+static uint32_t blFadeStart = 0;
+static uint32_t blFadeMs = 0;
+
+
+// The ONLY function that knows how the backlight hardware works.
+void setDisplayBrightness(uint8_t percent) {
+  if (percent > 100) percent = 100;
+
+#if TFT_BL_PIN >= 0
+  const uint32_t maxDuty = (1u << BL_PWM_RES_BITS) - 1;
+  ledcWrite(TFT_BL_PIN, (maxDuty * percent + 50) / 100);
+#else
+  (void)percent;   // no BL wire: nothing to drive
+#endif
+}
+
+static void setupBacklight() {
+#if TFT_BL_PIN >= 0
+  // ESP32 Arduino core 3.x API (this install is 3.3.11): ledcAttach() picks
+  // a free LEDC channel for the pin. Core 2.x used ledcSetup/ledcAttachPin.
+  if (ledcAttach(TFT_BL_PIN, BL_PWM_FREQ_HZ, BL_PWM_RES_BITS)) {
+    Serial.print("[JUNI] Backlight PWM on GPIO ");
+    Serial.println(TFT_BL_PIN);
+  } else {
+    Serial.println("[JUNI] ERROR: backlight PWM attach failed");
+  }
+#else
+  Serial.println("[JUNI] Backlight: no control pin (TFT_BL_PIN = -1), dimming is logged only");
+#endif
+
+  setDisplayBrightness(DISPLAY_BRIGHTNESS_ACTIVE);
+  blWritten = DISPLAY_BRIGHTNESS_ACTIVE;
+}
+
+static uint8_t backlightLevelAt(uint32_t now) {
+  uint32_t t = now - blFadeStart;
+  if (blFadeMs == 0 || t >= blFadeMs) return blTo;
+  return (uint8_t)(blFrom + ((int32_t)blTo - blFrom) * (int32_t)t / (int32_t)blFadeMs);
+}
+
+static void fadeBacklightTo(uint8_t percent, uint32_t durationMs, uint32_t now) {
+  blFrom = backlightLevelAt(now);   // start from wherever a running fade has got to
+  blTo = percent;
+  blFadeStart = now;
+  blFadeMs = durationMs;
+}
+
+static void wakeDisplay(uint32_t now) {
+  displayDimmed = false;
+  fadeBacklightTo(DISPLAY_BRIGHTNESS_ACTIVE, WAKE_FADE_MS, now);
+  Serial.println("[JUNI] Display awake");
+}
+
+// Call on every real touch of the knob. Returns true if the touch woke a
+// dimmed screen, so the caller can decide whether it should also do anything.
+static bool registerUserInteraction(uint32_t now) {
+  lastInteractionMs = now;
+
+  if (!displayDimmed) return false;
+
+  wakeDisplay(now);
+  return true;
+}
+
+static void updatePowerManagement(uint32_t now) {
+  if (currentState == JuniState::IDLE) {
+    if (
+      !displayDimmed &&
+      now - lastInteractionMs >= IDLE_DIM_TIMEOUT_MS
+    ) {
+      displayDimmed = true;
+      fadeBacklightTo(DISPLAY_BRIGHTNESS_DIM, DIM_FADE_MS, now);
+      Serial.println("[JUNI] Display dimmed");
+    }
+  }
+  else if (displayDimmed) {
+    // Only IDLE may be dim. Leaving IDLE always takes a knob touch, which
+    // already woke the screen. This is just a safety net.
+    wakeDisplay(now);
+  }
+
+  // Only touch the hardware when the level actually changes.
+  uint8_t level = backlightLevelAt(now);
+  if (level != blWritten) {
+    setDisplayBrightness(level);
+    blWritten = level;
+  }
+}
+
+
+// ============================================================
+// 9. INPUT
+// ============================================================
+
+// While true, the button press that woke the screen is ignored until the
+// finger lifts, so a wake press can never start a session by accident.
+static bool swallowButtonUntilRelease = false;
+
+static void updateInput(uint32_t now) {
+  int32_t rawSteps = 0;
+  inDetents = takeEncoderDetents(rawSteps);
+
+  ButtonEvents btn = readButton(now);
+  inPress = btn.press;
+
+  if (rawSteps != 0 || btn.down || btn.press != PRESS_NONE) {
+    bool woke = registerUserInteraction(now);
+
+    // Wake-first rule. Turning always does its normal job straight away
+    // (wake + enter SET_TIME). A press that woke the screen does nothing else.
+    if (woke && btn.down) {
+      swallowButtonUntilRelease = true;
+    }
+  }
+
+  if (swallowButtonUntilRelease) {
+    inPress = PRESS_NONE;
+    if (btn.up) swallowButtonUntilRelease = false;
+  }
+}
+
+
+// ============================================================
+// 10. STATE MACHINE
+// ============================================================
+
+// The one place the state changes. Each case sets up what the new state needs.
+static void enterState(JuniState next, uint32_t now) {
+  Serial.print("[JUNI] ");
+  Serial.print(stateName(currentState));
+  Serial.print(" -> ");
+  Serial.println(stateName(next));
+
+  currentState = next;
+  stateEnteredAt = now;
+
+  switch (next) {
+    case JuniState::IDLE:
+      // Clear the finished/cancelled session so nothing stale lingers.
+      remainingMs = 0;
+      focusEndsAt = 0;
+      // Arriving at IDLE restarts the dim countdown, even when it happens by
+      // itself (after CANCELLED, or the SET_TIME timeout).
+      lastInteractionMs = now;
+      break;
+
+    case JuniState::STARTING:
+      remainingMs = (int32_t)selectedMinutes * 60000L;
+      break;
+
+    case JuniState::FOCUSING:
+      // Works for a fresh start and for resuming: the deadline is simply
+      // "now + whatever is left".
+      focusEndsAt = now + (uint32_t)remainingMs;
+      break;
+
+    case JuniState::PAUSED:
+      // Nothing to do: updateTimer() refreshed remainingMs earlier this loop
+      // pass, and it only counts down while FOCUSING, so the value freezes.
+      break;
+
+    case JuniState::COMPLETE:
+      remainingMs = 0;
+      focusEndsAt = 0;
+      break;
+
+    case JuniState::SET_TIME:
+    case JuniState::CANCELLED:
+      // CANCELLED keeps showing the frozen time, as before, until IDLE clears it.
+      break;
+  }
+}
+
+
+static void adjustMinutes(int detents) {
+  if (detents == 0) return;
+
+  selectedMinutes =
+    constrain(
+      selectedMinutes + detents * STEP_MINUTES,
+      MIN_MINUTES,
+      MAX_MINUTES
+    );
+
+  pendingBumpDir = detents > 0 ? +1 : -1;
+
+  Serial.print("[JUNI] selected ");
+  Serial.print(selectedMinutes);
+  Serial.println(" min");
+}
+
+
+// What the knob does in each state, and the automatic transitions.
+static void updateCurrentState(uint32_t now) {
+  switch (currentState) {
+
+    case JuniState::IDLE:
+      if (inDetents != 0) {
+        enterState(JuniState::SET_TIME, now);
+        adjustMinutes(inDetents);
+      }
+      else if (inPress == PRESS_SHORT) {
+        // Quick start with the last chosen time (existing behaviour).
+        enterState(JuniState::STARTING, now);
+      }
+      break;
+
+    case JuniState::SET_TIME:
+      if (inDetents != 0) {
+        adjustMinutes(inDetents);
+      }
+      else if (inPress == PRESS_SHORT) {
+        enterState(JuniState::STARTING, now);
+      }
+      else if (now - lastInteractionMs >= SELECT_TIMEOUT_MS) {
+        enterState(JuniState::IDLE, now);
+      }
+      break;
+
+    case JuniState::STARTING:
+      if (now - stateEnteredAt >= STARTING_MS) {
+        enterState(JuniState::FOCUSING, now);
+      }
+      break;
+
+    case JuniState::FOCUSING:
+      if (remainingMs <= 0) {
+        // Only reachable from FOCUSING, so COMPLETE is entered exactly once.
+        enterState(JuniState::COMPLETE, now);
+      }
+      else if (inPress == PRESS_LONG) {
+        enterState(JuniState::CANCELLED, now);
+      }
+      else if (inPress == PRESS_SHORT) {
+        enterState(JuniState::PAUSED, now);
+      }
+      break;
+
+    case JuniState::PAUSED:
+      if (inPress == PRESS_LONG) {
+        enterState(JuniState::CANCELLED, now);
+      }
+      else if (inPress == PRESS_SHORT) {
+        enterState(JuniState::FOCUSING, now);
+      }
+      break;
+
+    case JuniState::CANCELLED:
+      if (now - stateEnteredAt >= CANCELING_MS) {
+        enterState(JuniState::IDLE, now);
+      }
+      break;
+
+    case JuniState::COMPLETE:
+      if (inPress != PRESS_NONE) {
+        enterState(JuniState::IDLE, now);
+      }
+      break;
+  }
+}
+
+
+// ============================================================
+// 11. TIMER
+// ============================================================
+
+// The countdown is a deadline, not a running subtraction: remaining time is
+// always "deadline - now", so it cannot drift however slow a frame is.
+static void updateTimer(uint32_t now) {
+  if (currentState != JuniState::FOCUSING) return;
+
+  int32_t left = (int32_t)(focusEndsAt - now);
+  remainingMs = left > 0 ? left : 0;
+}
+
+
+// ============================================================
+// 12. DISPLAY
+// ============================================================
+
+static JuniUI::State toUiState(JuniState s) {
+  switch (s) {
+    case JuniState::IDLE:      return JuniUI::IDLE;
+    case JuniState::SET_TIME:  return JuniUI::TIME_SELECT;
+    case JuniState::STARTING:  return JuniUI::STARTING;
+    case JuniState::FOCUSING:  return JuniUI::FOCUS;
+    case JuniState::PAUSED:    return JuniUI::BREAK;   // the existing pause screen
+    case JuniState::COMPLETE:  return JuniUI::FINISHED;
+    case JuniState::CANCELLED: return JuniUI::CANCELING;
+  }
+  return JuniUI::IDLE;
+}
+
+// Drawing only: reads the state, never changes it.
+static JuniState shownState = JuniState::IDLE;
+static uint32_t  lastFrameAt = 0;
+
+static void updateDisplay(uint32_t now) {
+  // Start the UI's transition animation as soon as the state changes.
+  if (currentState != shownState) {
+    shownState = currentState;
+    ui.enter(toUiState(currentState), now);
+  }
+
+  if (pendingBumpDir != 0) {
+    ui.bump(now, pendingBumpDir);
+    pendingBumpDir = 0;
+  }
+
+  if (now - lastFrameAt < FRAME_MS) return;
+  lastFrameAt = now;
+
+  // Ceil milliseconds to seconds:
+  // 24:59.2 remains displayed as 25:00 until a full second passes.
+  int remainingSeconds = 0;
+
+  if (remainingMs > 0) {
+    remainingSeconds =
+      (remainingMs + 999) / 1000;
+  }
+
+  ui.render(
+    frameBuffer,
+    now,
+    selectedMinutes,
+    remainingSeconds
+  );
+
+  pushFrame();
+}
+
+
+// ============================================================
+// 13. SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);   // setup only: gives the USB serial port a moment
+
+  // ---------- display: same setup as current juni_well_done ----------
+  SPI.begin(
+    TFT_SCLK,
+    -1,
+    TFT_MOSI,
+    TFT_CS
+  );
+
+  tft.init(240, 320);
+  tft.setRotation(0);
+  tft.setSPISpeed(TFT_SPI_HZ);
+
+  // IMPORTANT:
+  // Current JUNI files were corrected to NORMAL colors.
+  tft.invertDisplay(false);
+
+  tft.fillScreen(ST77XX_BLACK);
+
+  setupBacklight();
+
+
+  // ---------- encoder ----------
+  pinMode(ENC_S1, INPUT_PULLUP);
+  pinMode(ENC_S2, INPUT_PULLUP);
+  pinMode(ENC_KEY, INPUT_PULLUP);
+
+  encHistory =
+    (digitalRead(ENC_S1) << 1) |
+     digitalRead(ENC_S2);
+
+  attachInterrupt(
+    digitalPinToInterrupt(ENC_S1),
+    encoderISR,
+    CHANGE
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(ENC_S2),
+    encoderISR,
+    CHANGE
+  );
+
+  // Initialize the debounced button state so booting while untouched
+  // does not create a fake first press.
+  buttonRawLast =
+    (digitalRead(ENC_KEY) == LOW);
+
+  buttonStable =
+    buttonRawLast;
+
+
+  // ---------- full-screen RGB565 framebuffer ----------
+  const size_t framebufferBytes =
+    (size_t)JuniUI::W *
+    JuniUI::H *
+    sizeof(uint16_t);
+
+  frameBuffer =
+    (uint16_t *)ps_malloc(
+      framebufferBytes
+    );
+
+  // Fallback for boards where PSRAM is unavailable.
+  if (!frameBuffer) {
+    frameBuffer =
+      (uint16_t *)malloc(
+        framebufferBytes
+      );
+  }
+
+  if (!frameBuffer) {
+    Serial.println(
+      "[JUNI] ERROR: framebuffer allocation failed"
+    );
+
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(10, 30);
+    tft.print("Framebuffer");
+    tft.setCursor(10, 55);
+    tft.print("allocation failed");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  memset(
+    frameBuffer,
+    0,
+    framebufferBytes
+  );
+
+  textRenderer.setBuffer(frameBuffer);
+
+  // Connect generic text drawing to the full JUNI UI.
+  ui.drawText = drawTextHook;
+
+  // Lets the SET TIMER screen draw its number larger than any bundled font.
+  ui.drawBigNumber = drawBigNumberHook;
+
+  uint32_t now = millis();
+
+  lastInteractionMs = now;
+  stateEnteredAt = now;
+
+  ui.enter(JuniUI::IDLE, now);
+
+  // First frame immediately.
+  ui.render(
+    frameBuffer,
+    now,
+    selectedMinutes,
+    0
+  );
+
+  pushFrame();
+
+  Serial.println("[JUNI] full firmware ready");
+}
+
+
+// ============================================================
+// 14. LOOP
+// ============================================================
+//
+// Every pass runs the same pipeline, and none of these steps waits:
+//   input -> timer -> state machine -> power -> display
+// The timer runs before the state machine so FOCUSING sees an up-to-date
+// remaining time. Power runs after it so dimming follows the new state.
+
+void loop() {
+  uint32_t now = millis();
+
+  updateInput(now);            // read the knob, wake the screen if touched
+  updateTimer(now);            // advance the countdown while FOCUSING
+  updateCurrentState(now);     // decide what JUNI does next
+  updatePowerManagement(now);  // IDLE dim / wake, backlight fade
+  updateDisplay(now);          // draw a frame (~30 FPS)
+}
